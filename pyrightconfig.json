@@ -1,0 +1,9 @@
+{
+  "venvPath": "..",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "pythonPath": "../.venv/Scripts/python.exe",
+  "exclude": [
+    "**/__pyrefly_virtual__/**"
+  ]
+}

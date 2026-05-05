@@ -1,0 +1,147 @@
+"""Serializers for the accounts application of ClariDoc Pro."""
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from .models import Client, Succursale, Licence, Fichier, Log, Machine, PaymentRequest
+
+User = get_user_model()
+
+class ClientSerializer(serializers.ModelSerializer):
+    """Serializer for Client model."""
+    class Meta:
+        """Meta options for ClientSerializer."""
+        model = Client
+        fields = '__all__'
+
+class SuccursaleSerializer(serializers.ModelSerializer):
+    """Serializer for Succursale model."""
+    client_nom = serializers.CharField(source='client.nom', read_only=True)
+
+    class Meta:
+        """Meta options for SuccursaleSerializer."""
+        model = Succursale
+        fields = '__all__'
+
+class LicenceSerializer(serializers.ModelSerializer):
+    """Serializer for Licence model."""
+    succursale_nom = serializers.CharField(source='succursale.nom', read_only=True)
+
+    class Meta:
+        """Meta options for LicenceSerializer."""
+        model = Licence
+        fields = '__all__'
+        read_only_fields = ['cle_chiffree', 'aes_key_hex', 'iv_hex']
+
+class MachineSerializer(serializers.ModelSerializer):
+    """Serializer for Machine model."""
+    class Meta:
+        """Meta options for MachineSerializer."""
+        model = Machine
+        fields = '__all__'
+
+class PaymentRequestSerializer(serializers.ModelSerializer):
+    """Serializer for PaymentRequest model."""
+    client_nom = serializers.CharField(source='client.nom', read_only=True)
+    succursale_cible_nom = serializers.CharField(source='succursale_cible.nom', read_only=True)
+
+    class Meta:
+        """Meta options for PaymentRequestSerializer."""
+        model = PaymentRequest
+        fields = '__all__'
+        read_only_fields = ['client', 'statut']
+
+class UserSerializer(serializers.ModelSerializer):
+    """Serializer for User model including related names and password handling."""
+    client_nom = serializers.StringRelatedField(source='client', read_only=True)
+    succursale_nom = serializers.StringRelatedField(source='succursale', read_only=True)
+    password = serializers.CharField(write_only=True, required=False)
+
+    class Meta:
+        """Meta options for UserSerializer."""
+        model = User
+        fields = [
+            'id', 'username', 'email', 'first_name', 'last_name', 'role',
+            'client', 'succursale', 'client_nom', 'succursale_nom', 'is_active', 'password'
+        ]
+
+    def create(self, validated_data):
+        password = validated_data.pop('password', None)
+        user = super().create(validated_data)
+        if password:
+            user.set_password(password)
+            user.save()
+        return user
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop('password', None)
+        user = super().update(instance, validated_data)
+        if password:
+            user.set_password(password)
+            user.save()
+        return user
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """Custom JWT Token serializer to include extra user info."""
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+
+        # Ajouter des informations personnalisées au token
+        token['username'] = user.username
+        token['role'] = user.role
+        if user.client:
+            token['client_id'] = user.client.id
+            token['client_code'] = user.client.code_client
+        if user.succursale:
+            token['succursale_id'] = user.succursale.id
+
+        return token
+
+    def validate(self, attrs):
+        username = attrs.get("username")
+
+        # Recherche par email si nécessaire
+        if username and "@" in username:
+            user_found = User.objects.filter(email__iexact=username).first()
+            if user_found:
+                username = user_found.username
+                attrs["username"] = username
+                print(f"DEBUG LOGIN: Mapping Email -> Username '{username}'")
+
+        # Validation par SimpleJWT
+        try:
+            data = super().validate(attrs)
+            # AJOUTER les infos utilisateur (crucial pour le C#)
+            data['user'] = UserSerializer(self.user).data
+            return data
+        except Exception as e:
+            raise e
+
+    def create(self, validated_data):
+        """Not implemented for token serializer."""
+        return None
+
+    def update(self, instance, validated_data):
+        """Not implemented for token serializer."""
+        return None
+
+class FichierSerializer(serializers.ModelSerializer):
+    """Serializer for Fichier model."""
+    user_nom = serializers.CharField(source='user.username', read_only=True)
+
+    class Meta:
+        """Meta options for FichierSerializer."""
+        model = Fichier
+        fields = '__all__'
+        read_only_fields = ['client', 'user', 'created_at']
+
+class LogSerializer(serializers.ModelSerializer):
+    """Serializer for Log model."""
+    user_nom = serializers.CharField(source='user.username', read_only=True)
+    client_nom = serializers.CharField(source='client.nom', read_only=True)
+
+    class Meta:
+        """Meta options for LogSerializer."""
+        model = Log
+        fields = '__all__'
+        read_only_fields = ['client', 'user', 'created_at']
