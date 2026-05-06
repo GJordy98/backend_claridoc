@@ -23,7 +23,7 @@ from .serializers import (
     LicenceSerializer, LogSerializer, MachineSerializer, PaymentRequestSerializer,
     SuccursaleSerializer, UserSerializer,
 )
-from .services import encrypt_license_data, encrypt_simple_string, generate_aes_credentials
+from .services import encrypt_license_data, encrypt_simple_string, generate_aes_credentials, send_otp_email
 
 class LogPagination(PageNumberPagination):
     """Pagination for audit logs (30 items per page)."""
@@ -651,15 +651,25 @@ class RegisterView(APIView):
 
         from .models import OTPVerification
         otp_code = f"{random.randint(0, 999999):06d}"
-        
+
         OTPVerification.objects.filter(email=email).delete()
         OTPVerification.objects.create(email=email, code=otp_code)
-        
-        print("\n" + "="*50)
-        print(f"NOUVEAU CODE OTP POUR {email} : {otp_code}")
-        print("="*50 + "\n")
 
-        return Response({"message": "Inscription réussie. OTP requis.", "otp_required": True}, status=status.HTTP_201_CREATED)
+        # Envoi du code OTP par email via Brevo SMTP
+        sent = send_otp_email(
+            email=email,
+            otp_code=otp_code,
+            first_name=first_name,
+        )
+        if not sent:
+            # Fallback console si l'envoi échoue (logs visibles côté serveur)
+            print(f"[OTP FALLBACK] Code pour {email} : {otp_code}")
+
+        return Response(
+            {"message": "Inscription réussie. Un code de vérification a été envoyé par email.",
+             "otp_required": True},
+            status=status.HTTP_201_CREATED
+        )
 
 class VerifyOTPView(APIView):
     """Public API view to verify OTP and activate a user account."""

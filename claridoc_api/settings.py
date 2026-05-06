@@ -130,16 +130,16 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-# ─── EMAIL ────────────────────────────────────────────────────────────────────
-# MODE DEV : affichage dans le terminal (pas de serveur SMTP requis)
-# MODE PROD : remplacer la ligne EMAIL_BACKEND par celle commentée ci-dessous
-#             et renseigner les variables dans .env
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'  # ← activer en prod
+# ─── EMAIL — Brevo SMTP ───────────────────────────────────────────────────────
+# Toutes les valeurs sont lues depuis le fichier .env
+EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
+# EMAIL_BACKEND     = 'django.core.mail.backends.console.EmailBackend'  # ← dev local
 
-EMAIL_HOST          = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_HOST          = os.environ.get('EMAIL_HOST', 'smtp-relay.brevo.com')
 EMAIL_PORT          = int(os.environ.get('EMAIL_PORT', 587))
 EMAIL_USE_TLS       = True
+EMAIL_USE_SSL       = False
 EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')  # App Password Gmail
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL  = os.environ.get('DEFAULT_FROM_EMAIL', 'ClariDoc Pro <no-reply@claridoc.pro>')
+BREVO_API_KEY       = os.environ.get('BREVO_API_KEY', '')
