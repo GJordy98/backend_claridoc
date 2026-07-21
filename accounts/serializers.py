@@ -1,14 +1,16 @@
+# pyright: reportIncompatibleMethodOverride=false, reportIncompatibleVariableOverride=false
 """Serializers for the accounts application of ClariDoc Pro."""
+from typing import Any, cast
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from .models import Client, Succursale, Licence, Fichier, Log, Machine, PaymentRequest
+from .models import Client, Succursale, Licence, Fichier, Log, Machine, PaymentRequest, Visiteur
 
 User = get_user_model()
 
 class ClientSerializer(serializers.ModelSerializer):
     """Serializer for Client model."""
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for ClientSerializer."""
         model = Client
         fields = '__all__'
@@ -17,7 +19,7 @@ class SuccursaleSerializer(serializers.ModelSerializer):
     """Serializer for Succursale model."""
     client_nom = serializers.CharField(source='client.nom', read_only=True)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for SuccursaleSerializer."""
         model = Succursale
         fields = '__all__'
@@ -26,7 +28,7 @@ class LicenceSerializer(serializers.ModelSerializer):
     """Serializer for Licence model."""
     succursale_nom = serializers.CharField(source='succursale.nom', read_only=True)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for LicenceSerializer."""
         model = Licence
         fields = '__all__'
@@ -34,7 +36,7 @@ class LicenceSerializer(serializers.ModelSerializer):
 
 class MachineSerializer(serializers.ModelSerializer):
     """Serializer for Machine model."""
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for MachineSerializer."""
         model = Machine
         fields = '__all__'
@@ -44,7 +46,7 @@ class PaymentRequestSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
     succursale_cible_nom = serializers.CharField(source='succursale_cible.nom', read_only=True)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for PaymentRequestSerializer."""
         model = PaymentRequest
         fields = '__all__'
@@ -56,7 +58,7 @@ class UserSerializer(serializers.ModelSerializer):
     succursale_nom = serializers.StringRelatedField(source='succursale', read_only=True)
     password = serializers.CharField(write_only=True, required=False)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for UserSerializer."""
         model = User
         fields = [
@@ -110,7 +112,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
 
         # Validation par SimpleJWT
         try:
-            data = super().validate(attrs)
+            data = cast(dict[str, Any], super().validate(attrs))
             # AJOUTER les infos utilisateur (crucial pour le C#)
             data['user'] = UserSerializer(self.user).data
             return data
@@ -129,7 +131,7 @@ class FichierSerializer(serializers.ModelSerializer):
     """Serializer for Fichier model."""
     user_nom = serializers.CharField(source='user.username', read_only=True)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for FichierSerializer."""
         model = Fichier
         fields = '__all__'
@@ -140,8 +142,19 @@ class LogSerializer(serializers.ModelSerializer):
     user_nom = serializers.CharField(source='user.username', read_only=True)
     client_nom = serializers.CharField(source='client.nom', read_only=True)
 
-    class Meta:
+    class Meta:  # type: ignore[misc]
         """Meta options for LogSerializer."""
         model = Log
         fields = '__all__'
         read_only_fields = ['client', 'user', 'created_at']
+
+class VisiteurSerializer(serializers.ModelSerializer):
+    """Serializer for Visiteur model."""
+    client_nom = serializers.CharField(source='client.nom', read_only=True)
+    succursale_nom = serializers.CharField(source='succursale.nom', read_only=True)
+
+    class Meta:  # type: ignore[misc]
+        """Meta options for VisiteurSerializer."""
+        model = Visiteur
+        fields = '__all__'
+        read_only_fields = ['client', 'created_at']

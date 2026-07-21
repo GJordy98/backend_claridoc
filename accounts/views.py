@@ -4,8 +4,10 @@
 import random
 import string
 import uuid
+import requests
 from datetime import date as date_type
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db.models import Count, Sum
@@ -17,13 +19,19 @@ from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import Client, Fichier, Licence, Log, Machine, PaymentRequest, Succursale
+from .models import (
+    Client, Fichier, Licence, Log, Machine, PaymentRequest, Succursale,
+    OTPVerification, Visiteur
+)
 from .serializers import (
     ClientSerializer, CustomTokenObtainPairSerializer, FichierSerializer,
     LicenceSerializer, LogSerializer, MachineSerializer, PaymentRequestSerializer,
-    SuccursaleSerializer, UserSerializer,
+    SuccursaleSerializer, UserSerializer, VisiteurSerializer
 )
-from .services import encrypt_license_data, encrypt_simple_string, generate_aes_credentials, send_otp_email
+from .services import (
+    encrypt_license_data, encrypt_simple_string, generate_aes_credentials,
+    send_otp_email
+)
 
 class LogPagination(PageNumberPagination):
     """Pagination for audit logs (30 items per page)."""
@@ -282,13 +290,27 @@ class StartupVerifyView(APIView):
                 )
         else:
             # Cas 2: Démarrage habituel (vérification via Empreinte Matérielle)
-            machine = Machine.objects.filter(hwid=hardware_id, is_active=True).first()
-            if not machine:
+            machines = (
+                Machine.objects.filter(hwid=hardware_id, is_active=True)
+                .select_related('licence')
+            )
+            if not machines.exists():
                 return Response(
                     {'statut': 'MACHINE_INCONNUE',
                      'message': 'Poste non reconnu. Une activation est requise.'},
                     status=status.HTTP_401_UNAUTHORIZED
                 )
+
+            # Prioriser une licence non expirée s'il y a plusieurs liaisons actives
+            machine = None
+            for m in machines:
+                if m.licence.date_fin >= timezone.now().date():
+                    machine = m
+                    break
+
+            if not machine:
+                machine = machines.first()  # Repli sur la première (expirée)
+
             licence = machine.licence
 
         # Vérifier que le client est toujours actif (si lié)
@@ -321,6 +343,12 @@ class StartupVerifyView(APIView):
             # Mettre à jour la date de dernière connexion
             machine.save()
         except Machine.DoesNotExist:
+            # Désactiver toute liaison existante de cet HWID
+            # sur d'autres licences (pour libérer les quotas)
+            Machine.objects.filter(
+                hwid=hardware_id, is_active=True
+            ).update(is_active=False)
+
             # Nouvelle machine : vérifier le quota avant d'enregistrer
             active_machines_count = Machine.objects.filter(licence=licence, is_active=True).count()
             if active_machines_count >= licence.max_machines:
@@ -346,11 +374,22 @@ class StartupVerifyView(APIView):
 
         client = licence.succursale.client
         succ = licence.succursale
+
+        # Nom réel du forfait (durée : Mensuel / Annuel …) : issu de la dernière demande de
+        # paiement VALIDÉE pour cette succursale. La durée de licence et le nombre de postes
+        # découlent de ce forfait payé par le boss pour l'agence.
+        forfait_pr = PaymentRequest.objects.filter(
+            succursale_cible=succ, statut='VALIDE'
+        ).order_by('-updated_at').first()
+        plan_forfait = forfait_pr.forfait_duree if (forfait_pr and forfait_pr.forfait_duree) else 'PREMIUM'
+        forfait_postes = forfait_pr.forfait_postes if (forfait_pr and forfait_pr.forfait_postes) else ''
+
         payload = {
             'client_id': client.id,
             'max_postes': licence.max_machines,
             'expiration': licence.date_fin.strftime('%Y-%m-%d'),
-            'plan': 'PREMIUM',
+            'plan': plan_forfait,
+            'forfait_postes': forfait_postes,
             # Infos FTP pour la liaison locale
             'ftp_host': succ.ftp_host,
             'ftp_port': succ.ftp_port,
@@ -406,7 +445,10 @@ class LogViewSet(viewsets.ModelViewSet):
         """Return logs filtered by role and optional query params."""
         user = self.request.user
         if user.role == 'SUPERADMIN':
-            queryset = Log.objects.all()
+            # Confidentialité : les évènements visiteurs (VISITEUR_ENTREE / SORTIE)
+            # contiennent des données d'identité appartenant au client ; on ne les
+            # expose pas au superadmin. Le client garde l'accès à son propre audit.
+            queryset = Log.objects.exclude(action__startswith='VISITEUR')
         else:
             queryset = Log.objects.filter(client_id=user.client_id)
 
@@ -613,6 +655,37 @@ class RegisterView(APIView):
         email        = data.get('email')
         password     = data.get('password')
         telephone    = data.get('telephone')
+        captcha_token = data.get('captcha_token')
+
+        # CAPTCHA Validation (Cloudflare Turnstile)
+        if settings.TURNSTILE_SECRET_KEY:
+            if not captcha_token:
+                return Response(
+                    {"message": "La validation du CAPTCHA de sécurité est requise."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            try:
+                verify_res = requests.post(
+                    settings.TURNSTILE_VERIFY_URL,
+                    data={
+                        "secret": settings.TURNSTILE_SECRET_KEY,
+                        "response": captcha_token,
+                        "remoteip": request.META.get('REMOTE_ADDR')
+                    },
+                    timeout=5
+                )
+                verify_data = verify_res.json()
+                if not verify_data.get("success"):
+                    return Response(
+                        {"message": "Échec de validation du CAPTCHA de sécurité. Veuillez réessayer."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            except Exception as e:
+                print(f"[CAPTCHA ERROR] {str(e)}")
+                return Response(
+                    {"message": "Impossible de vérifier la sécurité CAPTCHA. Veuillez réessayer plus tard."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         if not all([nom_societe, first_name, last_name, email, password]):
             return Response(
@@ -649,7 +722,6 @@ class RegisterView(APIView):
             is_active=False
         )
 
-        from .models import OTPVerification
         otp_code = f"{random.randint(0, 999999):06d}"
 
         OTPVerification.objects.filter(email=email).delete()
@@ -677,23 +749,35 @@ class VerifyOTPView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        """Verify the OTP code and activate the user if valid."""
         email = request.data.get('email')
         code = request.data.get('code')
 
         if not email or not code:
-            return Response({"message": "Email et code sont requis."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"message": "Email et code sont requis."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        from .models import OTPVerification
         otp_record = OTPVerification.objects.filter(email=email).first()
 
         if not otp_record:
-            return Response({"message": "Aucun code OTP trouvé pour cet email."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"message": "Aucun code OTP trouvé pour cet email."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if not otp_record.is_valid():
-            return Response({"message": "Ce code OTP a expiré."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"message": "Ce code OTP a expiré."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if otp_record.code != code:
-            return Response({"message": "Code OTP incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"message": "Code OTP incorrect."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         user = User.objects.filter(email=email).first()
         if user:
@@ -803,6 +887,12 @@ class PaymentRequestViewSet(viewsets.ModelViewSet):
                     nom="Principale"
                 )
 
+            # Fiabiliser le lien demande ↔ succursale (utile pour retrouver le forfait
+            # d'une licence, y compris pour une nouvelle ouverture où succursale_cible
+            # était null au départ).
+            if pr.succursale_cible_id != succursale.id:
+                pr.succursale_cible = succursale
+
             # --- Créer ou mettre à jour la licence ---
             licence, created = Licence.objects.get_or_create(
                 succursale=succursale,
@@ -895,3 +985,66 @@ class UniversalResetPasswordView(APIView):
                 {"message": f"Mot de passe de '{user.username}' mis à jour avec succès !"}
             )
         return Response({"message": f"Utilisateur '{username}' non trouvé."}, status=404)
+
+class VisiteurViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing Visiteur records."""
+    serializer_class = VisiteurSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None
+
+    def get_queryset(self):
+        user = self.request.user
+        # Confidentialité : les données d'identité des visiteurs appartiennent au
+        # client. Le SUPERADMIN (opérateur ClariDoc) n'y a JAMAIS accès, comme pour
+        # les fichiers scannés (cf. FichierViewSet).
+        if user.role == 'SUPERADMIN':
+            return Visiteur.objects.none()
+        if user.client:
+            qs = Visiteur.objects.filter(client=user.client)
+        else:
+            return Visiteur.objects.none()
+
+        # Filtre optionnel par statut (?statut=PRESENT ou ?statut=PARTI)
+        statut = self.request.query_params.get('statut')
+        if statut:
+            qs = qs.filter(statut=statut)
+
+        # Ordre d'arrivée : du premier arrivé au dernier (chronologique).
+        return qs.order_by('date_entree')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        client = user.client
+        succursale = user.succursale
+        if user.role == 'SUPERADMIN':
+            client_id = self.request.data.get('client')
+            if client_id:
+                client = Client.objects.filter(id=client_id).first()
+            succursale_id = self.request.data.get('succursale')
+            if succursale_id:
+                succursale = Succursale.objects.filter(id=succursale_id).first()
+
+        visiteur = serializer.save(client=client, succursale=succursale)
+        create_log(
+            user,
+            "VISITEUR_ENTREE",
+            f"Visiteur {visiteur.nom} {visiteur.prenom} enregistré en entrée.",
+            client=client,
+            succursale=succursale
+        )
+
+    @action(detail=True, methods=['post'])
+    def sortie(self, request, pk=None):  # pylint: disable=unused-argument
+        """Record visitor departure."""
+        visiteur = self.get_object()
+        visiteur.date_sortie = timezone.now()
+        visiteur.statut = 'PARTI'
+        visiteur.save()
+        create_log(
+            request.user,
+            "VISITEUR_SORTIE",
+            f"Visiteur {visiteur.nom} {visiteur.prenom} enregistré en sortie.",
+            client=visiteur.client,
+            succursale=visiteur.succursale
+        )
+        return Response({"message": "Sortie enregistrée avec succès."})

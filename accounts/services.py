@@ -107,6 +107,7 @@ def send_otp_email(email: str, otp_code: str, first_name: str = "") -> bool:
 </html>"""
 
     try:
+        print(f"DEBUG: Tentative d'envoi OTP via SMTP avec l'expéditeur : {settings.DEFAULT_FROM_EMAIL}")
         msg = EmailMultiAlternatives(
             subject=subject,
             body=text_content,
@@ -126,64 +127,107 @@ import json
 import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
+# Bascule de format de chiffrement des licences / credentials.
+#   True  -> emet du AES-256-GCM v1 (authentifie, nonce aleatoire) -- RECOMMANDE
+#   False -> emet de l'AES-256-CBC (ancien format, pour la phase de migration)
+# Pilotable sans redeploiement via la variable d'environnement USE_GCM_ENCRYPTION.
+# Le DECHIFFREMENT detecte le format automatiquement quel que soit ce reglage.
+USE_GCM = os.environ.get('USE_GCM_ENCRYPTION', '1') == '1'
+
+GCM_VERSION = b'\x01'   # prefixe de version : 0x01 = AES-256-GCM v1
+GCM_NONCE_LEN = 12      # 96 bits, taille de nonce recommandee pour GCM
+
+
 def generate_aes_credentials():
-    """Génère une clé AES-256 et un IV aléatoires au format Hex."""
+    """Genere une cle AES-256 et un IV/nonce de base aleatoires au format Hex."""
     key = os.urandom(32)
     iv = os.urandom(16)
     return key.hex().upper(), iv.hex().upper()
 
-def encrypt_license_data(payload_dict, aes_key_hex, iv_hex):
-    """
-    Chiffre un dictionnaire JSON avec AES-256-CBC et PKCS7 padding.
-    Compatible avec le CryptoManager de l'application C# ClariDoc.
-    """
-    key = bytes.fromhex(aes_key_hex)
-    iv = bytes.fromhex(iv_hex)
-    
-    # Préparer les données
-    payload_str = json.dumps(payload_dict)
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(payload_str.encode('utf-8')) + padder.finalize()
-    
-    # Chiffrer
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    encrypted_bytes = encryptor.update(padded_data) + encryptor.finalize()
-    
-    # Retourner en Base64
-    return base64.b64encode(encrypted_bytes).decode('utf-8')
 
-def decrypt_license_data(encrypted_base64, aes_key_hex, iv_hex):
-    """
-    Déchiffre la licence (utile pour les tests backend).
-    """
+# ---------------------------------------------------------------------------
+# AES-256-GCM (nouveau format authentifie ; nonce aleatoire par message)
+# Format : base64( 0x01 || nonce(12) || ciphertext || tag(16) )
+# Compatible octet pour octet avec CryptoManager.DechiffrerGcm cote C#.
+# ---------------------------------------------------------------------------
+def _gcm_encrypt(plaintext, aes_key_hex, aad=b''):
+    key = bytes.fromhex(aes_key_hex)
+    nonce = os.urandom(GCM_NONCE_LEN)
+    ct_and_tag = AESGCM(key).encrypt(nonce, plaintext, aad)   # = ciphertext || tag(16)
+    return base64.b64encode(GCM_VERSION + nonce + ct_and_tag).decode('utf-8')
+
+
+def _gcm_decrypt(encoded, aes_key_hex, aad=b''):
+    key = bytes.fromhex(aes_key_hex)
+    blob = base64.b64decode(encoded)
+    if blob[:1] != GCM_VERSION:
+        raise ValueError("Prefixe GCM absent : ce n'est pas un blob AES-GCM v1.")
+    nonce = blob[1:1 + GCM_NONCE_LEN]
+    ct_and_tag = blob[1 + GCM_NONCE_LEN:]
+    return AESGCM(key).decrypt(nonce, ct_and_tag, aad)   # leve InvalidTag si altere
+
+
+def _is_gcm_blob(encoded):
+    try:
+        return base64.b64decode(encoded)[:1] == GCM_VERSION
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# AES-256-CBC (ancien format ; conserve pour dechiffrer les licences deja emises)
+# ---------------------------------------------------------------------------
+def _cbc_encrypt(plaintext, aes_key_hex, iv_hex):
     key = bytes.fromhex(aes_key_hex)
     iv = bytes.fromhex(iv_hex)
-    encrypted_bytes = base64.b64decode(encrypted_base64)
-    
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded_data = decryptor.update(encrypted_bytes) + decryptor.finalize()
-    
-    unpadder = padding.PKCS7(128).unpadder()
-    data = unpadder.update(padded_data) + unpadder.finalize()
-    
-    return json.loads(data.decode('utf-8'))
-def encrypt_simple_string(text, aes_key_hex, iv_hex):
-    """
-    Chiffre une simple chaîne (sans JSON) avec AES-256-CBC.
-    Idéal pour les mots de passe FTP.
-    """
-    key = bytes.fromhex(aes_key_hex)
-    iv = bytes.fromhex(iv_hex)
-    
     padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(text.encode('utf-8')) + padder.finalize()
-    
+    padded = padder.update(plaintext) + padder.finalize()
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    encrypted_bytes = encryptor.update(padded_data) + encryptor.finalize()
-    
-    return base64.b64encode(encrypted_bytes).decode('utf-8')
+    enc = cipher.encryptor()
+    return base64.b64encode(enc.update(padded) + enc.finalize()).decode('utf-8')
+
+
+def _cbc_decrypt(encoded, aes_key_hex, iv_hex):
+    key = bytes.fromhex(aes_key_hex)
+    iv = bytes.fromhex(iv_hex)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    dec = cipher.decryptor()
+    padded = dec.update(base64.b64decode(encoded)) + dec.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+# ---------------------------------------------------------------------------
+# API publique -- signatures inchangees (iv_hex conserve pour les appelants).
+# Le dechiffrement auto-detecte GCM vs CBC : aucun risque sur les licences
+# deja emises pendant la migration.
+# ---------------------------------------------------------------------------
+def encrypt_license_data(payload_dict, aes_key_hex, iv_hex=None):
+    """Chiffre un dict JSON. AES-GCM si USE_GCM, sinon AES-CBC (legacy)."""
+    data = json.dumps(payload_dict).encode('utf-8')
+    if USE_GCM:
+        return _gcm_encrypt(data, aes_key_hex)
+    return _cbc_encrypt(data, aes_key_hex, iv_hex)
+
+
+def encrypt_simple_string(text, aes_key_hex, iv_hex=None):
+    """Chiffre une chaine simple (ex. mot de passe FTP). AES-GCM ou AES-CBC."""
+    data = text.encode('utf-8')
+    if USE_GCM:
+        return _gcm_encrypt(data, aes_key_hex)
+    return _cbc_encrypt(data, aes_key_hex, iv_hex)
+
+
+def decrypt_simple_string(encrypted_base64, aes_key_hex, iv_hex=None):
+    """Dechiffre une chaine (auto-detection du format GCM ou CBC)."""
+    if _is_gcm_blob(encrypted_base64):
+        return _gcm_decrypt(encrypted_base64, aes_key_hex).decode('utf-8')
+    return _cbc_decrypt(encrypted_base64, aes_key_hex, iv_hex).decode('utf-8')
+
+
+def decrypt_license_data(encrypted_base64, aes_key_hex, iv_hex=None):
+    """Dechiffre la licence (auto-detection GCM/CBC) et renvoie le dict JSON."""
+    return json.loads(decrypt_simple_string(encrypted_base64, aes_key_hex, iv_hex))

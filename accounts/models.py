@@ -131,8 +131,9 @@ class Machine(models.Model):
 
     def __str__(self):
         # pylint: disable=no-member
-        has_succ = self.licence and self.licence.succursale
-        name = self.licence.succursale.nom if has_succ else 'Inconnue'
+        name = 'Inconnue'
+        if self.licence and self.licence.succursale:
+            name = self.licence.succursale.nom
         return f"Machine {self.hwid} (Licence {name})"
 
     objects = models.Manager()
@@ -216,6 +217,7 @@ class PaymentRequest(models.Model):
         """
         Choices for payment methods.
         """
+        NOTCHPAY = 'NOTCHPAY', 'Paiement Direct (NotchPay)'
         VIREMENT = 'VIREMENT', 'Virement Bancaire'
         MTN_MOMO = 'MTN_MOMO', 'MTN Mobile Money'
         ORANGE_MONEY = 'ORANGE_MONEY', 'Orange Money'
@@ -253,6 +255,8 @@ class PaymentRequest(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = models.Manager()
+
     def __str__(self):
         # pylint: disable=no-member
         return f"Demande {self.id} - {self.client.nom} ({self.statut})"
@@ -275,7 +279,46 @@ class OTPVerification(models.Model):
         """
         Checks if the OTP code is still within its validity period.
         """
+        if not self.expires_at:
+            return False
         return timezone.now() <= self.expires_at
 
     def __str__(self):
         return f"OTP for {self.email}"
+
+class Visiteur(models.Model):
+    """
+    Represents a visitor registered at a client's premises.
+    """
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='visiteurs')
+    succursale = models.ForeignKey(
+        Succursale, on_delete=models.SET_NULL, null=True, blank=True, related_name='visiteurs'
+    )
+    nom = models.CharField(max_length=150)
+    prenom = models.CharField(max_length=150)
+    date_naissance = models.DateField(null=True, blank=True)
+    numero_identite = models.CharField(max_length=100, null=True, blank=True)
+    nationalite = models.CharField(max_length=100, null=True, blank=True)
+    entreprise_visitee = models.CharField(max_length=255, null=True, blank=True)
+    date_entree = models.DateTimeField(default=timezone.now)
+    date_sortie = models.DateTimeField(null=True, blank=True)
+    photo_identite_chemin = models.TextField(null=True, blank=True)
+
+    class StatutVisiteur(models.TextChoices):
+        """Choices for visitor status."""
+        PRESENT = 'PRESENT', 'Présent'
+        PARTI = 'PARTI', 'Parti'
+
+    statut = models.CharField(
+        max_length=20,
+        choices=StatutVisiteur.choices,
+        default=StatutVisiteur.PRESENT
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.nom} {self.prenom} - {self.statut}"
+
+    objects = models.Manager()

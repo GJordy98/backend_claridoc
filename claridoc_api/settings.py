@@ -11,19 +11,41 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
-import dj_database_url
 from datetime import timedelta
 from pathlib import Path
+import dj_database_url
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load environment variables from .env file relative to project root
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-default-key')
 DEBUG = os.environ.get('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = ['*'] # À sécuriser en production
+
+# En local : défaut '*' (comportement inchangé). En prod : ALLOWED_HOSTS="api.mondomaine.com"
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
+
+# ---------------------------------------------------------------------------
+# Durcissement HTTPS — INACTIF par défaut (dev local en HTTP reste fonctionnel).
+# Le jour du passage en prod derrière un reverse-proxy/plateforme TLS :
+#   USE_HTTPS=1
+#   ALLOWED_HOSTS=api.mondomaine.com
+#   CSRF_TRUSTED_ORIGINS=https://app.mondomaine.com,https://api.mondomaine.com
+#   DEBUG=False  /  SECRET_KEY=<clé forte>
+# ---------------------------------------------------------------------------
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()]
+
+if os.environ.get('USE_HTTPS', '0') == '1':
+    # Le proxy (Caddy/nginx/Railway) termine le TLS et transmet ce header
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = True          # redirige tout HTTP -> HTTPS
+    SESSION_COOKIE_SECURE = True        # cookies de session uniquement en HTTPS
+    CSRF_COOKIE_SECURE = True           # cookie CSRF uniquement en HTTPS
+    SECURE_HSTS_SECONDS = 31536000      # HSTS 1 an
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -39,7 +61,18 @@ INSTALLED_APPS = [
 
     # Local apps
     'accounts',
+    'payments',
 ]
+
+# Steeve Payment Hub Configuration
+STEEVE_HUB_TOKEN = os.environ.get('STEEVE_HUB_TOKEN', '')
+STEEVE_HUB_WEBHOOK_SECRET = os.environ.get('STEEVE_HUB_WEBHOOK_SECRET', '')
+STEEVE_HUB_BASE_URL = os.environ.get('STEEVE_HUB_BASE_URL', 'http://109.199.117.118:8081/api-v1')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+# CAPTCHA Turnstile Configuration
+TURNSTILE_SECRET_KEY = os.environ.get('TURNSTILE_SECRET_KEY', '1x0000000000000000000000000000000AA')
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
 AUTH_USER_MODEL = 'accounts.User'
 
@@ -55,7 +88,12 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True # À configurer en production
+# CORS piloté par env.
+#   Local (défaut)  : CORS_ALLOW_ALL_ORIGINS=True  -> toutes origines (comportement inchangé).
+#   Prod            : CORS_ALLOW_ALL=0 + CORS_ALLOWED_ORIGINS="https://app.mondomaine.com"
+CORS_ALLOW_ALL_ORIGINS = os.environ.get('CORS_ALLOW_ALL', '1') == '1'
+CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+CORS_ALLOW_CREDENTIALS = os.environ.get('CORS_ALLOW_CREDENTIALS', '0') == '1'
 
 ROOT_URLCONF = 'claridoc_api.urls'
 
@@ -87,7 +125,7 @@ if not DATABASES['default']:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ.get('DB_NAME', 'claridoc_pro_v2'),
+            'NAME': os.environ.get('DB_NAME', 'claridoc_pro_V2'),
             'USER': os.environ.get('DB_USER', 'postgres'),
             'PASSWORD': os.environ.get('DB_PASSWORD', ''),
             'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
