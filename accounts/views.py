@@ -1,11 +1,12 @@
-"""Views for the accounts application of ClariDoc Pro."""
-# pylint: disable=no-member
+﻿"""Views for the accounts application of ClariDoc Pro."""
+# pylint: disable=no-member,too-many-lines
 
+from datetime import date as date_type
 import random
 import string
 import uuid
+
 import requests
-from datetime import date as date_type
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -29,7 +30,8 @@ from .serializers import (
     SuccursaleSerializer, UserSerializer, VisiteurSerializer
 )
 from .services import (
-    encrypt_license_data, encrypt_simple_string, generate_aes_credentials,
+    cles_licence, decrypt_simple_string, encrypt_license_data,
+    encrypt_simple_string, generate_aes_credentials, resoudre_config_ftp,
     send_otp_email
 )
 
@@ -381,8 +383,19 @@ class StartupVerifyView(APIView):
         forfait_pr = PaymentRequest.objects.filter(
             succursale_cible=succ, statut='VALIDE'
         ).order_by('-updated_at').first()
-        plan_forfait = forfait_pr.forfait_duree if (forfait_pr and forfait_pr.forfait_duree) else 'PREMIUM'
-        forfait_postes = forfait_pr.forfait_postes if (forfait_pr and forfait_pr.forfait_postes) else ''
+        plan_forfait = (
+            forfait_pr.forfait_duree if (forfait_pr and forfait_pr.forfait_duree) else 'PREMIUM'
+        )
+        forfait_postes = (
+            forfait_pr.forfait_postes if (forfait_pr and forfait_pr.forfait_postes) else ''
+        )
+
+        # Configuration FTP effective : celle de la succursale, ou a defaut celle
+        # d'une autre agence du MEME CLIENT (rechiffree pour cette licence).
+        # Sans ce repli, toute agence creee sans configuration FTP — le champ est
+        # vide par defaut — livrait un mot de passe vide a l'application, qui
+        # basculait hors-ligne en accusant le serveur de fichiers.
+        cfg_ftp = resoudre_config_ftp(succ)
 
         payload = {
             'client_id': client.id,
@@ -391,12 +404,15 @@ class StartupVerifyView(APIView):
             'plan': plan_forfait,
             'forfait_postes': forfait_postes,
             # Infos FTP pour la liaison locale
-            'ftp_host': succ.ftp_host,
-            'ftp_port': succ.ftp_port,
-            'ftp_user': succ.ftp_user,
-            'ftp_password_enc': succ.ftp_password_enc,
-            'ftp_base_path': succ.ftp_base_path,
-            'ftp_fingerprint': succ.ftp_fingerprint
+            'ftp_host': cfg_ftp['ftp_host'],
+            'ftp_port': cfg_ftp['ftp_port'],
+            'ftp_user': cfg_ftp['ftp_user'],
+            'ftp_password_enc': cfg_ftp['ftp_password_enc'],
+            'ftp_base_path': cfg_ftp['ftp_base_path'],
+            'ftp_fingerprint': cfg_ftp['ftp_fingerprint'],
+            # Aucune configuration FTP nulle part pour ce client : l'application
+            # doit le DIRE, au lieu de laisser croire a un serveur en panne.
+            'ftp_configuree': cfg_ftp['configuree']
         }
         licence.cle_chiffree = encrypt_license_data(payload, licence.aes_key_hex, licence.iv_hex)
         licence.save()
@@ -543,15 +559,39 @@ class SuccursaleConfigView(APIView):
                 {"message": "Aucune succursale associée ou trouvée."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        # Meme resolution que pour la payload de licence : l'ecran d'admin doit
+        # montrer la configuration REELLEMENT utilisee par l'application, sinon
+        # une agence qui fonctionne par heritage y apparaitrait vide.
+        cfg = resoudre_config_ftp(succursale)
+
+        # Le mot de passe est renvoye EN CLAIR, jamais chiffre.
+        # L'ancien comportement renvoyait le texte chiffre dans un champ que le
+        # PUT, lui, traite comme un mot de passe a chiffrer : un responsable qui
+        # ouvrait la page et enregistrait sans toucher au champ rechiffrait donc
+        # le chiffre, et le mot de passe devenait inutilisable en silence.
+        # Le clair n'est expose qu'aux roles qui peuvent deja le MODIFIER.
+        peut_voir = bool(user.client) and user.role in ('SUPERADMIN', 'BOSS', 'ADMIN')
+        mot_de_passe = ''
+        if peut_voir and cfg['ftp_password_enc']:
+            aes, iv = cles_licence(succursale)
+            if aes:
+                try:
+                    mot_de_passe = decrypt_simple_string(cfg['ftp_password_enc'], aes, iv)
+                except Exception:  # pylint: disable=broad-except
+                    mot_de_passe = ''
+
         return Response({
             "succursale_id": succursale.id,
-            "ftp_host": succursale.ftp_host,
-            "ftp_port": succursale.ftp_port,
-            "ftp_user": succursale.ftp_user,
-            "ftp_password_enc": succursale.ftp_password_enc,
-            "ftp_fingerprint": succursale.ftp_fingerprint,
-            "ftp_base_path": succursale.ftp_base_path,
-            "storage_mode": succursale.storage_mode
+            "ftp_host": cfg['ftp_host'],
+            "ftp_port": cfg['ftp_port'],
+            "ftp_user": cfg['ftp_user'],
+            "ftp_password": mot_de_passe,
+            "ftp_fingerprint": cfg['ftp_fingerprint'],
+            "ftp_base_path": cfg['ftp_base_path'],
+            "storage_mode": cfg['storage_mode'],
+            # Diagnostic : d'ou vient cette configuration.
+            "herite_de": cfg['herite_de'],
+            "configuree": cfg['configuree']
         }, status=status.HTTP_200_OK)
 
     def put(self, request):
@@ -575,18 +615,26 @@ class SuccursaleConfigView(APIView):
             succursale.ftp_port = data['ftp_port']
         if 'ftp_user' in data:
             succursale.ftp_user = data['ftp_user']
-        if 'ftp_password_enc' in data:
-            raw_password = data['ftp_password_enc']
-            if raw_password:
-                licence = getattr(succursale, 'licence', None)
-                if licence and licence.aes_key_hex:
-                    succursale.ftp_password_enc = encrypt_simple_string(
-                        raw_password, licence.aes_key_hex, licence.iv_hex
-                    )
-                else:
-                    succursale.ftp_password_enc = raw_password
+        # Deux champs aux sens DISTINCTS, pour lever l'ambiguite qui corrompait
+        # le mot de passe :
+        #   ftp_password     -> mot de passe EN CLAIR, chiffre ici (portail web)
+        #   ftp_password_enc -> DEJA chiffre par l'appelant, stocke tel quel
+        #                       (application C#, qui chiffre cote client dans
+        #                        FormAdmin avant l'envoi)
+        # Auparavant les deux clients ecrivaient dans ftp_password_enc, que cette
+        # vue chiffrait systematiquement : le C# subissait donc un DOUBLE
+        # chiffrement et le portail renvoyait le chiffre lu au GET.
+        if 'ftp_password' in data:
+            clair = data['ftp_password']
+            if clair:
+                aes, iv = cles_licence(succursale, creer=True)
+                succursale.ftp_password_enc = (
+                    encrypt_simple_string(clair, aes, iv) if aes else clair
+                )
             else:
                 succursale.ftp_password_enc = ""
+        elif 'ftp_password_enc' in data:
+            succursale.ftp_password_enc = data['ftp_password_enc'] or ""
         if 'ftp_fingerprint' in data:
             succursale.ftp_fingerprint = data['ftp_fingerprint']
         if 'ftp_base_path' in data:
@@ -677,13 +725,23 @@ class RegisterView(APIView):
                 verify_data = verify_res.json()
                 if not verify_data.get("success"):
                     return Response(
-                        {"message": "Échec de validation du CAPTCHA de sécurité. Veuillez réessayer."},
+                        {
+                            "message": (
+                                "Échec de validation du CAPTCHA de sécurité. "
+                                "Veuillez réessayer."
+                            )
+                        },
                         status=status.HTTP_400_BAD_REQUEST
                     )
-            except Exception as e:
+            except (requests.RequestException, ValueError) as e:
                 print(f"[CAPTCHA ERROR] {str(e)}")
                 return Response(
-                    {"message": "Impossible de vérifier la sécurité CAPTCHA. Veuillez réessayer plus tard."},
+                    {
+                        "message": (
+                            "Impossible de vérifier la sécurité CAPTCHA. "
+                            "Veuillez réessayer plus tard."
+                        )
+                    },
                     status=status.HTTP_400_BAD_REQUEST
                 )
 

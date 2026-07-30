@@ -35,7 +35,9 @@ ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split('
 #   CSRF_TRUSTED_ORIGINS=https://app.mondomaine.com,https://api.mondomaine.com
 #   DEBUG=False  /  SECRET_KEY=<clé forte>
 # ---------------------------------------------------------------------------
-CSRF_TRUSTED_ORIGINS = [o.strip() for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()]
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()
+]
 
 if os.environ.get('USE_HTTPS', '0') == '1':
     # Le proxy (Caddy/nginx/Railway) termine le TLS et transmet ce header
@@ -92,7 +94,9 @@ MIDDLEWARE = [
 #   Local (défaut)  : CORS_ALLOW_ALL_ORIGINS=True  -> toutes origines (comportement inchangé).
 #   Prod            : CORS_ALLOW_ALL=0 + CORS_ALLOWED_ORIGINS="https://app.mondomaine.com"
 CORS_ALLOW_ALL_ORIGINS = os.environ.get('CORS_ALLOW_ALL', '1') == '1'
-CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()
+]
 CORS_ALLOW_CREDENTIALS = os.environ.get('CORS_ALLOW_CREDENTIALS', '0') == '1'
 
 ROOT_URLCONF = 'claridoc_api.urls'

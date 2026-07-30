@@ -1,4 +1,4 @@
-import os
+﻿import os
 import logging
 from django.core.mail import EmailMultiAlternatives
 from django.conf import settings
@@ -231,3 +231,129 @@ def decrypt_simple_string(encrypted_base64, aes_key_hex, iv_hex=None):
 def decrypt_license_data(encrypted_base64, aes_key_hex, iv_hex=None):
     """Dechiffre la licence (auto-detection GCM/CBC) et renvoie le dict JSON."""
     return json.loads(decrypt_simple_string(encrypted_base64, aes_key_hex, iv_hex))
+
+
+# ---------------------------------------------------------------------------
+#  Configuration FTP effective d'une succursale
+# ---------------------------------------------------------------------------
+
+def cles_licence(succursale, creer=False):
+    """(aes_key_hex, iv_hex) de la licence d'une succursale, ou (None, None).
+
+    Avec creer=True, les cles ABSENTES sont generees et enregistrees. Une licence
+    jamais activee n'en possede pas encore : la vue de verification les cree au
+    vol, mais s'appuyer sur cet ordre rendrait la resolution FTP dependante du
+    chemin d'appel — l'ecran d'administration, lui, verrait une agence vide.
+    L'operation est idempotente et sans effet de bord visible : une licence sans
+    cle est de toute facon inutilisable.
+    """
+    lic = getattr(succursale, 'licence', None)
+    if not lic:
+        return None, None
+    if not lic.aes_key_hex:
+        if not creer:
+            return None, None
+        aes, iv = generate_aes_credentials()
+        lic.aes_key_hex, lic.iv_hex = aes, iv
+        lic.save(update_fields=['aes_key_hex', 'iv_hex'])
+    return lic.aes_key_hex, lic.iv_hex
+
+
+def resoudre_config_ftp(succursale):
+    """Configuration FTP EFFECTIVE d'une succursale, avec repli sur le client.
+
+    Le modele prevoit une configuration FTP par succursale, mais en pratique
+    chaque societe cliente possede UN compte FileZilla partage par ses agences.
+    Une agence creee sans configuration (le champ est vide par defaut) rendait
+    donc l'application inutilisable, avec un message accusant le serveur de
+    fichiers alors que l'agence n'avait simplement jamais ete configuree.
+
+    Comportement par DEFAUT : une succursale sans mot de passe FTP herite de la
+    configuration d'une autre succursale DU MEME CLIENT qui en possede une.
+    Le mot de passe est DECHIFFRE avec la cle de licence de la succursale de
+    reference puis RECHIFFRE avec celle de la demandeuse : chaque licence a sa
+    propre cle, une simple recopie du texte chiffre donnerait un mot de passe
+    illisible cote application.
+
+    EXCEPTION : une succursale qui possede son propre mot de passe garde
+    integralement sa configuration. Le repli ne concerne que le champ vide, si
+    bien qu'une agence a compte FTP distinct n'est jamais ecrasee.
+
+    Rien n'est ecrit en base : la resolution est calculee a chaque appel, donc
+    une modification de la configuration de reference se propage aussitot.
+
+    Renvoie un dict aux cles ftp_host, ftp_port, ftp_user, ftp_password_enc,
+    ftp_fingerprint, ftp_base_path, storage_mode, plus deux cles de diagnostic :
+      herite_de  : id de la succursale source, ou None
+      configuree : False si NI la succursale NI le client n'ont de configuration
+                   (cas d'un client entierement neuf) -> l'appelant doit le dire
+                   clairement plutot que de laisser croire a une panne serveur.
+    """
+    propre = {
+        'ftp_host': succursale.ftp_host,
+        'ftp_port': succursale.ftp_port,
+        'ftp_user': succursale.ftp_user,
+        'ftp_password_enc': succursale.ftp_password_enc,
+        'ftp_fingerprint': succursale.ftp_fingerprint,
+        'ftp_base_path': succursale.ftp_base_path,
+        'storage_mode': succursale.storage_mode,
+        'herite_de': None,
+        'configuree': bool(succursale.ftp_password_enc),
+    }
+
+    if succursale.ftp_password_enc:
+        return propre
+
+    # creer=True : la succursale destinataire DOIT disposer d'une cle pour qu'on
+    # puisse rechiffrer a son intention. La reference, elle, n'est jamais
+    # modifiee — on ne fait que lire sa configuration.
+    aes_dst, iv_dst = cles_licence(succursale, creer=True)
+    if not aes_dst:
+        # Aucune licence rattachee : rien a rechiffrer, on renvoie tel quel.
+        return propre
+
+    # Import local : ce module est importe par models.py au chargement de
+    # l'application, un import global de Succursale creerait un cycle.
+    from .models import Succursale  # pylint: disable=import-outside-toplevel
+
+    references = (
+        Succursale.objects
+        .filter(client=succursale.client)
+        .exclude(id=succursale.id)
+        .exclude(ftp_password_enc__isnull=True)
+        .exclude(ftp_password_enc='')
+        .order_by('id')
+    )
+
+    for ref in references:
+        aes_src, iv_src = cles_licence(ref)
+        if not aes_src:
+            continue
+        try:
+            clair = decrypt_simple_string(ref.ftp_password_enc, aes_src, iv_src)
+        except Exception:  # pylint: disable=broad-except
+            # Reference illisible (cle regeneree, format inattendu) : on essaie
+            # la suivante plutot que de faire echouer toute la resolution.
+            continue
+        try:
+            rechiffre = encrypt_simple_string(clair, aes_dst, iv_dst)
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+        # On herite du BLOC COMPLET, pas du seul mot de passe : un compte
+        # emprunte au client combine a l'hote ou au chemin par defaut de
+        # l'agence produirait une configuration incoherente, donc un echec
+        # bien plus difficile a diagnostiquer qu'une absence de configuration.
+        return {
+            'ftp_host': ref.ftp_host,
+            'ftp_port': ref.ftp_port,
+            'ftp_user': ref.ftp_user,
+            'ftp_password_enc': rechiffre,
+            'ftp_fingerprint': ref.ftp_fingerprint,
+            'ftp_base_path': ref.ftp_base_path,
+            'storage_mode': ref.storage_mode,
+            'herite_de': ref.id,
+            'configuree': True,
+        }
+
+    return propre
