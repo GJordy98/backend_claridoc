@@ -315,6 +315,27 @@ class Visiteur(models.Model):
         default=StatutVisiteur.PRESENT
     )
 
+    class TypeDocument(models.TextChoices):
+        """Nature de la pièce d'identité présentée par le visiteur."""
+        CNI = 'CNI', 'Carte nationale d\'identité'
+        PASSEPORT = 'PASSEPORT', 'Passeport'
+        AUTRE = 'AUTRE', 'Autre / non déterminé'
+
+    # Le moteur OCR renvoie une valeur FINE ('passeport', 'cni_2016_recto',
+    # 'cni_2024_verso'...). Elle est ramenée aux trois categories ci-dessus par
+    # VisiteurSerializer.normaliser_type_document : le backend reste la
+    # reference unique et tolere les ecarts de version entre postes clients.
+    #
+    # NULL = visiteur enregistre avant l'introduction du champ (juillet 2026),
+    # a distinguer de AUTRE qui signifie « piece presentee, type indetermine ».
+    type_document = models.CharField(
+        max_length=20,
+        choices=TypeDocument.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

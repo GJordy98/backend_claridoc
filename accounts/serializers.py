@@ -152,9 +152,60 @@ class VisiteurSerializer(serializers.ModelSerializer):
     """Serializer for Visiteur model."""
     client_nom = serializers.CharField(source='client.nom', read_only=True)
     succursale_nom = serializers.CharField(source='succursale.nom', read_only=True)
+    # Libelle pret a afficher : evite au frontend et a l'appli C# de dupliquer
+    # la table de correspondance.
+    type_document_libelle = serializers.CharField(
+        source='get_type_document_display', read_only=True, default=None
+    )
+    # Declare explicitement en CharField : le modele porte des `choices`, donc
+    # ModelSerializer genererait un ChoiceField qui rejetterait 'cni_2024_recto'
+    # AVANT validate_type_document. On accepte donc la valeur fine telle quelle
+    # et on la normalise nous-memes.
+    type_document = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True, max_length=40
+    )
 
     class Meta:  # type: ignore[misc]
         """Meta options for VisiteurSerializer."""
         model = Visiteur
         fields = '__all__'
         read_only_fields = ['client', 'created_at']
+
+    # Valeur FINE renvoyee par le moteur OCR -> categorie stockee.
+    # La detection passeport s'appuie sur la MRZ TD3 validee par checksums
+    # ICAO : c'est une preuve autoportante, donc fiable meme quand les champs
+    # extraits sont mediocres.
+    _PREFIXES_TYPE = (
+        ('passeport', Visiteur.TypeDocument.PASSEPORT),
+        ('passport', Visiteur.TypeDocument.PASSEPORT),
+        ('cni', Visiteur.TypeDocument.CNI),
+        ('carte', Visiteur.TypeDocument.CNI),
+    )
+
+    @classmethod
+    def normaliser_type_document(cls, brut):
+        """Ramene une valeur OCR quelconque aux trois categories du modele.
+
+        Tolere None, la casse, les espaces, et les variantes fines
+        ('cni_2024_verso', 'PASSEPORT', 'passeport_td3'...). Une valeur non
+        reconnue mais NON VIDE devient AUTRE : une piece a bien ete presentee,
+        c'est son type qui est indetermine. Une valeur vide reste None, ce qui
+        distingue les visiteurs anterieurs au champ.
+        """
+        if brut is None:
+            return None
+        texte = str(brut).strip().lower()
+        if not texte:
+            return None
+        # Deja normalise ?
+        for valeur in Visiteur.TypeDocument.values:
+            if texte == valeur.lower():
+                return valeur
+        for prefixe, categorie in cls._PREFIXES_TYPE:
+            if texte.startswith(prefixe):
+                return categorie
+        return Visiteur.TypeDocument.AUTRE
+
+    def validate_type_document(self, value):
+        """Normalise a l'entree, quelle que soit la finesse envoyee par le client."""
+        return self.normaliser_type_document(value)
