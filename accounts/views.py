@@ -1,33 +1,39 @@
-﻿"""Views for the accounts application of ClariDoc Pro."""
+"""Views for the accounts application of ClariDoc Pro."""
 # pylint: disable=no-member,too-many-lines
 
-from datetime import date as date_type
+import os
 import random
 import string
+import sys
 import uuid
+from datetime import date as date_type
 
+import django
 import requests
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
-from django.db.models import Count, Sum
+from django.db import transaction
+from django.db.models import Count, Max, Q, Sum
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.pagination import PageNumberPagination
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     Client, Fichier, Licence, Log, Machine, PaymentRequest, Succursale,
-    OTPVerification, Visiteur
+    OTPVerification, Visiteur, FicheHotel, ConfigFicheHotel
 )
 from .serializers import (
     ClientSerializer, CustomTokenObtainPairSerializer, FichierSerializer,
     LicenceSerializer, LogSerializer, MachineSerializer, PaymentRequestSerializer,
-    SuccursaleSerializer, UserSerializer, VisiteurSerializer
+    SuccursaleSerializer, UserSerializer, VisiteurSerializer, FicheHotelSerializer,
+    ConfigFicheHotelSerializer
 )
 from .services import (
     cles_licence, decrypt_simple_string, encrypt_license_data,
@@ -1226,3 +1232,477 @@ class VisiteurViewSet(viewsets.ModelViewSet):
             succursale=visiteur.succursale
         )
         return Response({"message": "Sortie enregistrée avec succès."})
+
+
+class FicheHotelPagination(PageNumberPagination):
+    """Pagination du registre hôtel.
+
+    50 fiches par page : assez pour couvrir un mois chargé d'un petit
+    établissement en un seul appel, sans jamais renvoyer des milliers de
+    lignes quand l'historique s'accumule.
+    Le client peut ajuster via ?page_size= (plafonné à 200).
+    """
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 200
+
+
+class FicheHotelViewSet(viewsets.ModelViewSet):
+    """Registre des fiches d'entrée d'un établissement hôtelier."""
+    serializer_class = FicheHotelSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = FicheHotelPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        # Confidentialité : une fiche d'hôtel concentre plus de données
+        # personnelles qu'une fiche visiteur (domicile, e-mail, enfants
+        # mineurs). Le SUPERADMIN (opérateur ClariDoc) n'y a JAMAIS accès,
+        # exactement comme pour les fichiers et les visiteurs.
+        if user.role == 'SUPERADMIN':
+            return FicheHotel.objects.none()
+        if not user.client:
+            return FicheHotel.objects.none()
+
+        qs = FicheHotel.objects.filter(client=user.client).prefetch_related('accompagnants')
+
+        # Filtres du registre : ?statut=EN_COURS, ?chambre=204, ?annee=2026
+        statut = self.request.query_params.get('statut')
+        if statut:
+            qs = qs.filter(statut=statut)
+        chambre = self.request.query_params.get('chambre')
+        if chambre:
+            # Recherche partielle : « 20 » trouve « 204 », « 204A », « 1204 »
+            qs = qs.filter(chambre__icontains=chambre)
+        annee = self.request.query_params.get('annee')
+        if annee:
+            qs = qs.filter(annee=annee)
+
+        # Filtres de recherche par identité (insensible à la casse et aux
+        # accents différents selon les claviers).
+        nom = self.request.query_params.get('nom')
+        if nom:
+            qs = qs.filter(nom__icontains=nom)
+        prenom = self.request.query_params.get('prenom')
+        if prenom:
+            qs = qs.filter(prenom__icontains=prenom)
+
+        return qs.order_by('-date_arrivee')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        client = user.client
+        succursale = user.succursale
+        if user.role == 'SUPERADMIN':
+            client_id = self.request.data.get('client')
+            if client_id:
+                client = Client.objects.filter(id=client_id).first()
+            succursale_id = self.request.data.get('succursale')
+            if succursale_id:
+                succursale = Succursale.objects.filter(id=succursale_id).first()
+
+        annee = timezone.now().year
+
+        # Numérotation SÉRIALISÉE. Deux réceptions qui valident au même instant
+        # ne doivent pas obtenir le même numéro : on verrouille la ligne du
+        # client le temps de lire le dernier numéro et d'écrire le suivant.
+        # unique_together sur (client, annee, numero_fiche) reste le garde-fou
+        # si un jour ce verrou saute.
+        with transaction.atomic():
+            if client:
+                Client.objects.select_for_update().filter(pk=client.pk).first()
+            dernier = FicheHotel.objects.filter(
+                client=client, annee=annee
+            ).aggregate(Max('numero_fiche'))['numero_fiche__max'] or 0
+            fiche = serializer.save(
+                client=client, succursale=succursale,
+                annee=annee, numero_fiche=dernier + 1,
+            )
+
+        create_log(
+            user,
+            "FICHE_HOTEL_ENTREE",
+            f"Fiche d'entrée {fiche.annee}-{fiche.numero_fiche:04d} — "
+            f"{fiche.nom} {fiche.prenom} enregistrée.",
+            client=client,
+            succursale=succursale,
+        )
+
+    def perform_update(self, serializer):
+        """Journalise les corrections : une fiche est un registre.
+
+        L'opérateur peut corriger ce que l'OCR a mal lu, y compris après
+        validation. La trace de la correction, elle, ne se perd pas.
+        """
+        fiche = serializer.save()
+        create_log(
+            self.request.user,
+            "FICHE_HOTEL_MODIF",
+            f"Fiche d'entrée {fiche.annee}-{fiche.numero_fiche:04d} modifiée.",
+            client=fiche.client,
+            succursale=fiche.succursale,
+        )
+
+    @action(detail=True, methods=['post'])
+    def depart(self, request, pk=None):  # pylint: disable=unused-argument
+        """Clôture le séjour : le client a quitté l'établissement."""
+        fiche = self.get_object()
+        fiche.date_depart_reelle = timezone.now()
+        fiche.statut = FicheHotel.StatutFiche.TERMINE
+        fiche.save()
+        create_log(
+            request.user,
+            "FICHE_HOTEL_DEPART",
+            f"Fiche d'entrée {fiche.annee}-{fiche.numero_fiche:04d} — "
+            f"départ de {fiche.nom} {fiche.prenom}.",
+            client=fiche.client,
+            succursale=fiche.succursale,
+        )
+        return Response(self.get_serializer(fiche).data)
+
+
+class ConfigFicheHotelView(APIView):
+    """API de consultation et de modification de la configuration de la fiche hôtel.
+
+    - GET: Accessible à tous les rôles du client (SUPERADMIN, BOSS, ADMIN, USER, GARDIEN).
+    - PUT/PATCH/POST/DELETE: Réservé aux rôles d'administration (SUPERADMIN, BOSS, ADMIN).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def _get_client_and_config(self, request):
+        user = request.user
+        if user.role == 'SUPERADMIN':
+            client_id = request.query_params.get('client_id') or request.data.get('client_id')
+            if client_id:
+                client = Client.objects.filter(id=client_id).first()
+            else:
+                client = user.client
+        else:
+            client = user.client
+
+        if not client:
+            return None, None
+
+        config, _ = ConfigFicheHotel.objects.get_or_create(client=client)
+        return client, config
+
+    def _est_autorise_ecriture(self, user):
+        """Vérifie si l'utilisateur peut modifier la configuration (SUPERADMIN, BOSS, ADMIN)."""
+        return user.role in ('SUPERADMIN', 'BOSS', 'ADMIN')
+
+    def get(self, request):
+        """Récupère la configuration de la fiche hôtel pour le client de l'utilisateur."""
+        _, config = self._get_client_and_config(request)
+        if not config:
+            return Response(
+                {"error": "Aucun client associé à cet utilisateur."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        serializer = ConfigFicheHotelSerializer(config, context={'request': request})
+        return Response(serializer.data)
+
+    def put(self, request):
+        """Met à jour entièrement la configuration de la fiche hôtel."""
+        if not self._est_autorise_ecriture(request.user):
+            return Response(
+                {"error": (
+                    "Seuls les rôles SUPERADMIN, BOSS et ADMIN"
+                    " peuvent modifier la configuration."
+                )},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        _, config = self._get_client_and_config(request)
+        if not config:
+            return Response(
+                {"error": "Aucun client associé à cet utilisateur."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ConfigFicheHotelSerializer(
+            config, data=request.data, partial=False, context={'request': request}
+        )
+        if serializer.is_valid():
+            serializer.save()
+            create_log(
+                request.user,
+                "CONFIG_HOTEL_MODIF",
+                f"Configuration de la fiche hôtel mise à jour pour {config.client.nom}.",
+                client=config.client
+            )
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def patch(self, request):
+        """Met à jour partiellement la configuration de la fiche hôtel."""
+        if not self._est_autorise_ecriture(request.user):
+            return Response(
+                {"error": (
+                    "Seuls les rôles SUPERADMIN, BOSS et ADMIN"
+                    " peuvent modifier la configuration."
+                )},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        _, config = self._get_client_and_config(request)
+        if not config:
+            return Response(
+                {"error": "Aucun client associé à cet utilisateur."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ConfigFicheHotelSerializer(
+            config, data=request.data, partial=True, context={'request': request}
+        )
+        if serializer.is_valid():
+            serializer.save()
+            create_log(
+                request.user,
+                "CONFIG_HOTEL_MODIF",
+                f"Configuration de la fiche hôtel mise à jour (partial) pour {config.client.nom}.",
+                client=config.client
+            )
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def post(self, request):
+        """Permet l'upload du logo de l'hôtel."""
+        if not self._est_autorise_ecriture(request.user):
+            return Response(
+                {"error": "Seuls les rôles SUPERADMIN, BOSS et ADMIN peuvent modifier le logo."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        _, config = self._get_client_and_config(request)
+        if not config:
+            return Response(
+                {"error": "Aucun client associé à cet utilisateur."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if 'logo' not in request.FILES:
+            return Response(
+                {"error": "Aucun fichier 'logo' n'a été fourni."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        config.logo = request.FILES['logo']
+        config.save()
+        create_log(
+            request.user,
+            "CONFIG_HOTEL_LOGO",
+            f"Nouveau logo de fiche hôtel téléversé pour {config.client.nom}.",
+            client=config.client
+        )
+        serializer = ConfigFicheHotelSerializer(config, context={'request': request})
+        return Response(serializer.data)
+
+    def delete(self, request):
+        """Supprime le logo de l'hôtel."""
+        if not self._est_autorise_ecriture(request.user):
+            return Response(
+                {"error": "Seuls les rôles SUPERADMIN, BOSS et ADMIN peuvent supprimer le logo."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        _, config = self._get_client_and_config(request)
+        if not config:
+            return Response(
+                {"error": "Aucun client associé à cet utilisateur."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if config.logo:
+            config.logo.delete(save=True)
+            create_log(
+                request.user,
+                "CONFIG_HOTEL_LOGO_DELETE",
+                f"Logo de la fiche hôtel supprimé pour {config.client.nom}.",
+                client=config.client
+            )
+
+        serializer = ConfigFicheHotelSerializer(config, context={'request': request})
+        return Response(serializer.data)
+
+
+class HubSummaryView(APIView):
+    """API de Sommaire Centralisée pour le Hub d'Administration d'Entreprise.
+    
+
+    Expose en un seul appel consolidé toutes les métriques métier, le registre d'activité,
+    les erreurs/bugs récents, et l'état de santé du système pour le Hub Supervision.
+    
+
+    Authentification :
+    - Via Token dans le header `X-Hub-Token` ou paramètre `?token=...`
+    - OU via JWT utilisateur authentifié (SUPERADMIN, BOSS, ADMIN).
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def _est_autorise(self, request):
+        token_env = os.environ.get('ADMIN_HUB_TOKEN', getattr(settings, 'STEEVE_HUB_TOKEN', ''))
+        token_req = request.headers.get('X-Hub-Token') or request.query_params.get('token')
+        if token_env and token_req and token_req.strip() == token_env.strip():
+            return True
+        if request.user and request.user.is_authenticated:
+            role = getattr(request.user, 'role', '')
+            if role in ('SUPERADMIN', 'BOSS', 'ADMIN') or request.user.is_superuser:
+                return True
+        # Si aucun token configuré en env, autoriser en mode dev si DEBUG=True
+        if settings.DEBUG and not token_env:
+            return True
+        return False
+
+    def get(self, request):
+        """Retourne le sommaire consolidé du Hub d'Administration."""
+        if not self._est_autorise(request):
+            return Response(
+                {"error": (
+                    "Accès non autorisé au Hub d'Administration. "
+                    "Fournissez un token X-Hub-Token valide ou connectez-vous."
+                )},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        now = timezone.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # ── 1. Métriques globales ───────────────────────────────────────────
+        total_clients = Client.objects.count()
+        active_clients = Client.objects.filter(is_active=True).count()
+        total_succursales = Succursale.objects.count()
+        total_users = User.objects.count()
+        total_visiteurs = Visiteur.objects.count()
+        total_fiches_hotel = FicheHotel.objects.count()
+        total_fichiers = Fichier.objects.count()
+        total_storage_bytes = Fichier.objects.aggregate(total=Sum('taille_octets'))['total'] or 0
+        total_machines = Machine.objects.count()
+        active_machines = Machine.objects.filter(is_active=True).count()
+        pending_payments = PaymentRequest.objects.filter(
+            statut=PaymentRequest.StatutPaiement.EN_ATTENTE
+        ).count()
+
+        # ── 2. Activité du jour ──────────────────────────────────────────────
+        visiteurs_today = Visiteur.objects.filter(created_at__gte=today_start).count()
+        fiches_hotel_today = FicheHotel.objects.filter(created_at__gte=today_start).count()
+        fichiers_today = Fichier.objects.filter(created_at__gte=today_start).count()
+        logs_today = Log.objects.filter(created_at__gte=today_start).count()
+
+        # Filtre d'erreurs/bugs récents dans les logs
+        error_filter = (
+            Q(action__icontains='ERROR') |
+            Q(action__icontains='FAIL') |
+            Q(action__icontains='REJETE') |
+            Q(action__icontains='EXPIRED') |
+            Q(details__icontains='Exception') |
+            Q(details__icontains='Error') |
+            Q(details__icontains='Échec')
+        )
+        errors_today = Log.objects.filter(error_filter, created_at__gte=today_start).count()
+
+        # ── 3. Derniers logs système (Audit) ──────────────────────────────────
+        logs_qs = (
+            Log.objects.select_related('user', 'client', 'succursale')
+            .order_by('-created_at')[:25]
+        )
+        recent_logs = []
+        for l in logs_qs:
+            recent_logs.append({
+                'id': l.id,
+                'created_at': l.created_at.isoformat(),
+                'action': l.action,
+                'details': l.details,
+                'nom_fichier': l.nom_fichier,
+                'type_document': l.type_document,
+                'user': l.user.username if l.user else None,
+                'client': l.client.nom if l.client else None,
+                'succursale': l.succursale.nom if l.succursale else None,
+            })
+
+        # ── 4. Registre des Erreurs & Warnings récents ───────────────────────
+        error_logs_qs = (
+            Log.objects.filter(error_filter)
+            .select_related('user', 'client', 'succursale')
+            .order_by('-created_at')[:20]
+        )
+        recent_errors = []
+        for l in error_logs_qs:
+            recent_errors.append({
+                'id': l.id,
+                'created_at': l.created_at.isoformat(),
+                'action': l.action,
+                'details': l.details,
+                'user': l.user.username if l.user else None,
+                'client': l.client.nom if l.client else None,
+            })
+
+        # ── 5. Synthèse par Client ───────────────────────────────────────────
+        clients_qs = Client.objects.all().order_by('-created_at')
+        clients_summary = []
+        for c in clients_qs:
+            licence_fin = None
+            # Recherche de licence expirant la plus tard
+            lics = Licence.objects.filter(succursale__client=c).order_by('-date_fin')
+            if lics.exists():
+                licence_fin = str(lics.first().date_fin)
+
+            clients_summary.append({
+                'id': c.id,
+                'nom': c.nom,
+                'code_client': c.code_client,
+                'statut': c.statut,
+                'is_active': c.is_active,
+                'succursales_count': c.succursales.count(),
+                'users_count': c.users.count(),
+                'visiteurs_count': Visiteur.objects.filter(client=c).count(),
+                'fiches_hotel_count': FicheHotel.objects.filter(client=c).count(),
+                'licence_expiration': licence_fin,
+            })
+
+        # ── 6. État de Santé Système ─────────────────────────────────────────
+        health_info = {
+            'database': 'CONNECTED',
+            'environment': 'production' if not settings.DEBUG else 'development',
+            'debug_mode': settings.DEBUG,
+            'python_version': (
+                f"{sys.version_info.major}."
+                f"{sys.version_info.minor}."
+                f"{sys.version_info.micro}"
+            ),
+            'django_version': django.get_version(),
+            'storage_mb': round(total_storage_bytes / (1024 * 1024), 2),
+        }
+
+        data = {
+            'status': 'SUCCESS',
+            'app_name': 'ClariDoc Pro Backend API',
+            'version': '2.1.0',
+            'timestamp': now.isoformat(),
+            'system_health': health_info,
+            'metrics': {
+                'total_clients': total_clients,
+                'active_clients': active_clients,
+                'total_succursales': total_succursales,
+                'total_users': total_users,
+                'total_visiteurs': total_visiteurs,
+                'total_fiches_hotel': total_fiches_hotel,
+                'total_fichiers': total_fichiers,
+                'total_storage_bytes': total_storage_bytes,
+                'total_machines': total_machines,
+                'active_machines': active_machines,
+                'pending_payments': pending_payments,
+            },
+            'today_activity': {
+                'visiteurs_today': visiteurs_today,
+                'fiches_hotel_today': fiches_hotel_today,
+                'fichiers_today': fichiers_today,
+                'logs_today': logs_today,
+                'errors_today': errors_today,
+            },
+            'recent_logs': recent_logs,
+            'system_errors_and_alerts': recent_errors,
+            'clients_summary': clients_summary,
+        }
+
+        return Response(data, status=status.HTTP_200_OK)

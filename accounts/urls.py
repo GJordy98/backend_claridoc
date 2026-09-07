@@ -8,7 +8,8 @@ from .views import (
     UserViewSet, ClientViewSet, SuccursaleViewSet, LicenceViewSet,
     CustomTokenObtainPairView, StartupVerifyView, FichierViewSet, LogViewSet,
     MachineViewSet, SuccursaleConfigView, PaymentRequestViewSet, RegisterView,
-    VerifyOTPView, UniversalResetPasswordView, VisiteurViewSet
+    VerifyOTPView, UniversalResetPasswordView, VisiteurViewSet, FicheHotelViewSet,
+    ConfigFicheHotelView, HubSummaryView
 )
 
 router = DefaultRouter()
@@ -21,8 +22,13 @@ router.register(r'logs', LogViewSet, basename='log')
 router.register(r'machines', MachineViewSet, basename='machine')
 router.register(r'payments', PaymentRequestViewSet, basename='payment')
 router.register(r'visiteurs', VisiteurViewSet, basename='visiteur')
+router.register(r'fiches-hotel', FicheHotelViewSet, basename='fichehotel')
 
 urlpatterns = [
+    # Route pour le Hub d'Administration d'Entreprise / Supervision Centralisée
+    path('hub-summary/', HubSummaryView.as_view(), name='hub_summary'),
+    path('admin-summary/', HubSummaryView.as_view(), name='admin_summary'),
+
     # Route PUBLIQUE : vérification de licence au démarrage de l'app C#
     path('startup/verify/', StartupVerifyView.as_view(), name='startup_verify'),
 
@@ -34,6 +40,9 @@ urlpatterns = [
 
     # Route pour la configuration FTP de la succursale
     path('config/', SuccursaleConfigView.as_view(), name='succursale_config'),
+
+    # Route pour la configuration et personnalisation de la fiche hôtel (charte + champs)
+    path('config-fiche-hotel/', ConfigFicheHotelView.as_view(), name='config_fiche_hotel'),
 
     # Route de maintenance pour réinitialiser n'importe quel mot de passe
     path(

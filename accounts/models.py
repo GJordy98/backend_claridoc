@@ -421,3 +421,188 @@ class Visiteur(models.Model):
         return f"{self.nom} {self.prenom} - {self.statut}"
 
     objects = models.Manager()
+
+
+class FicheHotel(models.Model):
+    """Fiche d'entrée remplie à la réception d'un établissement hôtelier.
+
+    Deux niveaux de champs, et la distinction compte :
+
+    * le SOCLE STANDARD reprend la fiche individuelle de police dont le modèle
+      est fixé par l'arrêté du 1er octobre 2015. Il est toujours rempli et
+      toujours imprimé.
+    * les CHAMPS D'ÉTABLISSEMENT sont les ajouts courants des hôtels (chambre,
+      motif, pièce d'identité...). Ils existent TOUS en base dès cette
+      migration, même ceux qu'aucun hôtel n'affiche : c'est ce qui permet
+      d'adapter la fiche à un nouveau client par une simple ligne de
+      configuration côté poste (section [FicheHotel] de claridoc.config), sans
+      jamais rejouer une migration.
+
+    Un champ vide ne signifie donc PAS « l'hôtel ne le demande pas » : il
+    signifie « non renseigné ». C'est la configuration du poste, pas la base,
+    qui dit ce qui est demandé.
+    """
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='fiches_hotel')
+    succursale = models.ForeignKey(
+        Succursale, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='fiches_hotel'
+    )
+
+    # ── Numérotation ──────────────────────────────────────────────────────
+    # Attribuée par le SERVEUR, jamais par le poste : deux établissements ne
+    # doivent pas produire deux fiches n° 142. Séquentielle par client et par
+    # année, remise à 1 au 1er janvier.
+    annee = models.PositiveIntegerField(db_index=True)
+    numero_fiche = models.PositiveIntegerField()
+
+    # ── Socle standard (arrêté du 1er octobre 2015) ───────────────────────
+    nom = models.CharField(max_length=150)
+    prenom = models.CharField(max_length=150)
+    date_naissance = models.DateField(null=True, blank=True)
+    lieu_naissance = models.CharField(max_length=255, null=True, blank=True)
+    nationalite = models.CharField(max_length=100, null=True, blank=True)
+    domicile = models.TextField(null=True, blank=True)
+    telephone = models.CharField(max_length=40, null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    date_arrivee = models.DateTimeField(default=timezone.now)
+    date_depart_prevue = models.DateField(null=True, blank=True)
+
+    # ── Champs d'établissement (activés au cas par cas côté poste) ────────
+    chambre = models.CharField(max_length=40, null=True, blank=True)
+    sexe = models.CharField(max_length=10, null=True, blank=True)
+    profession = models.CharField(max_length=150, null=True, blank=True)
+    numero_identite = models.CharField(max_length=100, null=True, blank=True)
+    date_expiration = models.DateField(null=True, blank=True)
+    nombre_personnes = models.PositiveSmallIntegerField(default=1)
+    motif_sejour = models.CharField(max_length=255, null=True, blank=True)
+    provenance = models.CharField(max_length=255, null=True, blank=True)
+    destination = models.CharField(max_length=255, null=True, blank=True)
+
+    class TypeDocument(models.TextChoices):
+        """Nature de la pièce présentée. Mêmes valeurs que Visiteur."""
+        CNI = 'CNI', 'Carte nationale d\'identité'
+        PASSEPORT = 'PASSEPORT', 'Passeport'
+        AUTRE = 'AUTRE', 'Autre / non déterminé'
+
+    # Comme pour Visiteur : le moteur OCR renvoie une valeur FINE
+    # ('cni_2024_verso', 'passeport'...), ramenée à ces trois catégories par
+    # le sérialiseur. Le backend reste la référence unique.
+    type_document = models.CharField(
+        max_length=20, choices=TypeDocument.choices,
+        null=True, blank=True, db_index=True,
+    )
+
+    # ── Séjour et pièces produites ────────────────────────────────────────
+    class StatutFiche(models.TextChoices):
+        """Le client est-il encore dans l'établissement ?"""
+        EN_COURS = 'EN_COURS', 'Séjour en cours'
+        TERMINE = 'TERMINE', 'Séjour terminé'
+
+    statut = models.CharField(
+        max_length=20, choices=StatutFiche.choices, default=StatutFiche.EN_COURS
+    )
+    date_depart_reelle = models.DateTimeField(null=True, blank=True)
+
+    fiche_pdf_chemin = models.TextField(null=True, blank=True)
+    signee = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Options du modèle FicheHotel."""
+        # Le couple (client, année, numéro) est l'identifiant métier de la
+        # fiche : c'est lui qui garantit qu'un numéro n'est jamais réutilisé.
+        unique_together = [('client', 'annee', 'numero_fiche')]
+        ordering = ['-date_arrivee']
+
+    def __str__(self):
+        return f"Fiche {self.annee}-{self.numero_fiche:04d} · {self.nom} {self.prenom}"
+
+    objects = models.Manager()
+
+
+class FicheHotelAccompagnant(models.Model):
+    """Enfant de moins de quinze ans accompagnant le voyageur.
+
+    Table LIÉE et non colonne JSON : un registre doit pouvoir répondre à
+    « qui se trouvait dans l'établissement le 12 mars », mineurs compris.
+    Un bloc JSON rendrait cette question ininterrogeable.
+
+    Les champs reprennent ceux du bloc « Accompanying children under 15 » du
+    modèle standard.
+    """
+    fiche = models.ForeignKey(
+        FicheHotel, on_delete=models.CASCADE, related_name='accompagnants'
+    )
+    nom = models.CharField(max_length=150)
+    prenom = models.CharField(max_length=150, null=True, blank=True)
+    date_naissance = models.DateField(null=True, blank=True)
+    lieu_naissance = models.CharField(max_length=255, null=True, blank=True)
+    nationalite = models.CharField(max_length=100, null=True, blank=True)
+
+    class Meta:
+        """Options du modèle FicheHotelAccompagnant."""
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.nom} {self.prenom or ''}".strip()
+
+    objects = models.Manager()
+
+
+class FicheHotelCoOccupant(models.Model):
+    """Personne adulte (≥ 15 ans) co-occupant la chambre avec le voyageur principal.
+    
+    Possède sa propre pièce d'identité enregistrée au registre.
+    """
+    fiche = models.ForeignKey(
+        FicheHotel, on_delete=models.CASCADE, related_name='co_occupants'
+    )
+    nom = models.CharField(max_length=150)
+    prenom = models.CharField(max_length=150, null=True, blank=True)
+    date_naissance = models.DateField(null=True, blank=True)
+    lieu_naissance = models.CharField(max_length=255, null=True, blank=True)
+    nationalite = models.CharField(max_length=100, null=True, blank=True)
+    numero_identite = models.CharField(max_length=100, null=True, blank=True)
+    type_document = models.CharField(max_length=20, null=True, blank=True)
+
+    class Meta:
+        """Options du modèle FicheHotelCoOccupant."""
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.nom} {self.prenom or ''}".strip()
+
+    objects = models.Manager()
+
+
+class ConfigFicheHotel(models.Model):
+    """Configuration et personnalisation de la fiche hôtel par client.
+
+    Permet d'adapter l'apparence (logo, en-tête, pied de page, couleur principale)
+    et les champs affichés/obligatoires sur les fiches d'entrée.
+    """
+    client = models.OneToOneField(
+        Client, on_delete=models.CASCADE, related_name='config_fiche_hotel'
+    )
+
+    # ── Charte graphique & PDF ───────────────────────────────────────────────
+    logo = models.FileField(upload_to='logos_hotel/', null=True, blank=True)
+    entete = models.TextField(null=True, blank=True)
+    pied_de_page = models.TextField(null=True, blank=True)
+    couleur_principale = models.CharField(max_length=7, default='#1a3c5e')
+
+    # ── Configuration des champs d'établissement (JSON) ────────────────────
+    # Contient la liste des champs configurables avec leur état :
+    # [{"field": "chambre", "visible": true, "obligatoire": true,
+    #   "ordre": 1, "libelle": "Numéro de chambre"}]
+    champs = models.JSONField(default=list, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = models.Manager()
+
+    def __str__(self):
+        return f"Config Fiche Hôtel - {self.client.nom}"  # pylint: disable=no-member

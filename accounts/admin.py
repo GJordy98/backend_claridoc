@@ -2,7 +2,17 @@
 
 from typing import Any
 from django.contrib import admin
-from .models import Client, Succursale, Licence, Machine, User, Fichier, Log, PaymentRequest
+from .models import (  # noqa: F401
+    Client,
+    Succursale,
+    Licence,
+    Machine,
+    User,
+    Fichier,
+    Log,
+    PaymentRequest,
+    ConfigFicheHotel,
+)
 
 
 @admin.register(Client)
@@ -76,3 +86,11 @@ class LogAdmin(admin.ModelAdmin):
     list_display: Any = ('user', 'client', 'action', 'created_at')
     list_filter = ('created_at',)
     search_fields = ('action', 'user__username')
+
+
+@admin.register(ConfigFicheHotel)
+class ConfigFicheHotelAdmin(admin.ModelAdmin):
+    """Administration de la configuration des fiches d'hôtel."""
+
+    list_display: Any = ('client', 'couleur_principale', 'updated_at')
+    search_fields = ('client__nom',)
