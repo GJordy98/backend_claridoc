@@ -1,0 +1,12 @@
+﻿[MASTER]
+# Active le plugin pylint-django pour que pylint comprenne les ORM Django
+# (resout : Class 'X' has no 'objects' member)
+load-plugins=pylint_django
+
+[DJANGO]
+django-settings-module=claridoc_api.settings
+
+[MESSAGES CONTROL]
+# C0415 = import-outside-toplevel  (imports dans des fonctions, legitimes pour Django)
+# C0103 = invalid-name             (User = get_user_model(), convention Django admise)
+disable=C0415,C0103
