@@ -75,6 +75,30 @@ class User(AbstractUser):
         BOSS = 'BOSS', 'Chef d\'entreprise'
         ADMIN = 'ADMIN', 'Administrateur Succursale'
         USER = 'USER', 'Utilisateur (Scanner)'
+        GARDIEN = 'GARDIEN', 'Gardien (Registre visiteurs)'
+
+    # ── Groupes de rôles ────────────────────────────────────────────────────
+    # USER et GARDIEN sont au MÊME niveau hiérarchique : deux métiers distincts
+    # sans autorité l'un sur l'autre, et aucun des deux ne peut créer de compte.
+    # La SEULE chose qui les sépare : le gardien n'a pas accès aux fichiers
+    # numérisés — ils ne lui servent à rien, autant ne pas les lui exposer.
+    #
+    # Le registre des visiteurs, lui, n'est restreint pour PERSONNE : il reste
+    # ouvert à tous les rôles, exactement comme avant l'arrivée du gardien.
+    ROLES_ADMINISTRATION = ('SUPERADMIN', 'BOSS', 'ADMIN')
+    ROLES_FICHIERS = ('SUPERADMIN', 'BOSS', 'ADMIN', 'USER')
+
+    # Ce qu'un rôle a le droit de CRÉER comme comptes. Un ADMIN de succursale
+    # peuple son agence en USER et GARDIEN, sans pouvoir se cloner ni fabriquer
+    # un SUPERADMIN — c'était possible jusqu'ici, l'API acceptait n'importe quel
+    # `role` envoyé par n'importe quel compte authentifié.
+    ROLES_CREABLES = {
+        'SUPERADMIN': ('SUPERADMIN', 'BOSS', 'ADMIN', 'USER', 'GARDIEN'),
+        'BOSS': ('ADMIN', 'USER', 'GARDIEN'),
+        'ADMIN': ('USER', 'GARDIEN'),
+        'USER': (),
+        'GARDIEN': (),
+    }
 
     role = models.CharField(max_length=20, choices=RoleChoices.choices, default=RoleChoices.USER)
     client = models.ForeignKey(
@@ -87,6 +111,21 @@ class User(AbstractUser):
     def __str__(self):
         # pylint: disable=no-member
         return f"{self.username} - {self.get_role_display()}"
+
+    # ── Droits calculés (mêmes noms côté C# : SessionUtilisateur) ────────────
+    @property
+    def est_administrateur(self):
+        """Vrai pour SUPERADMIN / BOSS / ADMIN : accès aux écrans d'administration."""
+        return self.role in self.ROLES_ADMINISTRATION
+
+    @property
+    def peut_gerer_fichiers(self):
+        """Vrai pour tous sauf GARDIEN : numérisation, galerie, historique."""
+        return self.role in self.ROLES_FICHIERS
+
+    def peut_creer_role(self, role_cible):
+        """Dit si cet utilisateur a le droit de créer un compte de `role_cible`."""
+        return role_cible in self.ROLES_CREABLES.get(self.role, ())
 
 class Licence(models.Model):
     """
@@ -178,6 +217,45 @@ class Log(models.Model):
     """
     Audit log for actions performed by users within the system.
     """
+
+    # ── Ce que le SUPERADMIN (opérateur ClariDoc) a le droit de lire ────────
+    # Règle produit : il ne voit RIEN de privé. Ni les fichiers, ni les visiteurs,
+    # ni l'activité métier de ses clients. Il voit le FONCTIONNEMENT : qui se
+    # connecte, quels comptes et quels postes existent, la configuration, les
+    # paiements — de quoi exploiter le service et diagnostiquer une panne.
+    #
+    # C'est une LISTE BLANCHE de préfixes, volontairement : tout évènement qui
+    # n'y figure pas est invisible pour ce rôle. Un nouveau type de log ajouté
+    # plus tard est donc privé PAR DÉFAUT, et il faut un geste explicite ici
+    # pour l'exposer. L'inverse (une liste noire) laisserait fuir le prochain
+    # évènement métier que personne n'aura pensé à y ajouter.
+    #
+    # Exclus par construction : SCAN_* (le libellé porte le nom réel du document
+    # numérisé) et VISITEUR_* (identités de visiteurs).
+    ACTIONS_VISIBLES_SUPERADMIN = (
+        'CONNEXION',      # ouverture de session sur l'application
+        'DECONNEXION',
+        'LOGIN',          # LOGIN_WEB : connexion au portail
+        'LOGOUT',
+        'USER_',          # USER_CREE, USER_ACTIVÉ, USER_BLOQUÉ
+        'MACHINE_',       # MACHINE_ACTIVÉ, MACHINE_BLOQUÉ
+        'CONFIG_',        # CONFIG_UPDATE
+        'PAYMENT_',       # PAYMENT_VALIDATED
+    )
+
+    @classmethod
+    def filtre_visible_superadmin(cls):
+        """Filtre ne retenant que les évènements de fonctionnement.
+
+        Utilisé PARTOUT où le superadmin lit le journal — la liste elle-même et
+        les statistiques qui en dérivent. Deux portes sur la même donnée : sans
+        ce point de passage unique, restreindre la liste laissait le décompte par
+        type d'action (`action_stats`) annoncer « SCAN_PDF : 143 » pour un client.
+        """
+        filtre = models.Q()
+        for prefixe in cls.ACTIONS_VISIBLES_SUPERADMIN:
+            filtre |= models.Q(action__startswith=prefixe)
+        return filtre
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, related_name='logs', null=True, blank=True
     )

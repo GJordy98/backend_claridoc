@@ -46,6 +46,15 @@ class LogPagination(PageNumberPagination):
 User = get_user_model()
 
 
+class PeutGererFichiers(permissions.BasePermission):
+    """Réserve les fichiers numérisés à tout le monde SAUF le GARDIEN."""
+    message = "Ce compte ne gère pas les fichiers numérisés."
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and user.peut_gerer_fichiers)
+
+
 def create_log(user, action_type, details="", client=None, succursale=None):
     """Create an audit log entry for the given user and action."""
     try:
@@ -87,6 +96,51 @@ class UserViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = None  # Désactiver la pagination pour simplifier l'app C#
 
+    def create(self, request, *args, **kwargs):
+        """Refuse la création d'un compte que le demandeur n'a pas le droit de créer.
+
+        Contrôle placé AVANT la validation du sérialiseur : l'API acceptait
+        jusqu'ici n'importe quel `role` envoyé par n'importe quel compte
+        authentifié — un USER pouvait donc se fabriquer un ADMIN, voire un
+        SUPERADMIN. La table de référence est User.ROLES_CREABLES.
+        """
+        # Le rôle doit être fourni EXPLICITEMENT. Il y avait ici un repli sur
+        # 'USER' : une requête arrivant sans rôle — ou avec un rôle laissé à sa
+        # valeur par défaut par un client périmé — créait donc un compte
+        # Utilisateur sans que rien ne le signale. C'est exactement ce qui est
+        # arrivé au compte « jean » le 20/08/2026, créé en USER alors que le
+        # rôle demandé était GARDIEN. Un compte sans rôle est désormais refusé.
+        role_brut = request.data.get('role')
+        if role_brut is None or not str(role_brut).strip():
+            return Response(
+                {"role": ["Le rôle du compte doit être fourni explicitement."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        role_cible = str(role_brut).strip().upper()
+        if role_cible not in User.RoleChoices.values:
+            # Sans ce contrôle, un rôle inconnu (client périmé, faute de frappe)
+            # tombait dans le test de permission ci-dessous et ressortait en 403
+            # « votre rôle ne permet pas de créer un compte X » — message trompeur
+            # pour ce qui est en réalité un rôle inexistant.
+            return Response(
+                {"role": [
+                    f"Rôle inconnu « {role_cible} ». Rôles acceptés : "
+                    + ", ".join(User.RoleChoices.values) + "."
+                ]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not request.user.peut_creer_role(role_cible):
+            return Response(
+                {"role": [
+                    f"Votre rôle ({request.user.role}) ne permet pas de créer "
+                    f"un compte « {role_cible} »."
+                ]},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         """Create a user and assign client/succursale based on the requester's role."""
         user = self.request.user
@@ -104,15 +158,71 @@ class UserViewSet(viewsets.ModelViewSet):
 
         succursale_id = self.request.data.get('succursale')
         succursale = None
-        if succursale_id:
+        # Un ADMIN ne peuple QUE sa propre agence : sa succursale est imposée,
+        # jamais lue depuis la requête (sinon il lui suffisait d'envoyer l'id
+        # d'une autre agence du même client pour y placer un compte).
+        if user.role == 'ADMIN':
+            succursale = user.succursale
+        elif succursale_id:
             try:
                 succursale = Succursale.objects.get(id=succursale_id)
             except Succursale.DoesNotExist:
                 pass
-        elif user.role == 'ADMIN' and user.succursale:
-            succursale = user.succursale
 
-        serializer.save(client=client, succursale=succursale)
+        nouveau = serializer.save(client=client, succursale=succursale)
+        create_log(
+            user,
+            "USER_CREE",
+            f"Compte {nouveau.username} créé avec le rôle {nouveau.role}.",
+            client=client,
+            succursale=succursale
+        )
+
+    def update(self, request, *args, **kwargs):
+        """Interdit de PROMOUVOIR un compte vers un rôle qu'on ne peut pas créer.
+
+        Sans ce garde-fou, la restriction posée à la création se contournait en
+        deux temps : chaque compte se voit lui-même dans `get_queryset`, donc un
+        USER ou un GARDIEN pouvait faire PATCH /users/<son id>/ {"role": "ADMIN"}.
+        DRF route `partial_update` vers `update`, PATCH est donc couvert aussi.
+        """
+        cible = self.get_object()
+        role_avant = cible.role
+
+        role_demande = request.data.get('role')
+        if role_demande is not None:
+            role_demande = str(role_demande).strip().upper()
+            if role_demande != role_avant \
+                    and not request.user.peut_creer_role(role_demande):
+                return Response(
+                    {"role": [
+                        f"Votre rôle ({request.user.role}) ne permet pas d'attribuer "
+                        f"le rôle « {role_demande} »."
+                    ]},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        reponse = super().update(request, *args, **kwargs)
+
+        # Un changement de rôle change ce que le compte voit dans l'application :
+        # il doit être traçable. Seule la CRÉATION était journalisée jusqu'ici, si
+        # bien qu'un rôle modifié après coup ne laissait aucune trace — or c'est le
+        # journal d'audit qui a permis d'établir que le compte « jean » avait été
+        # enregistré en USER ; il faut la même preuve pour les modifications.
+        try:
+            cible.refresh_from_db()
+            if cible.role != role_avant:
+                create_log(
+                    request.user,
+                    "USER_ROLE_MODIFIE",
+                    f"Rôle du compte {cible.username} : {role_avant} → {cible.role}.",
+                    client=cible.client,
+                    succursale=cible.succursale
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Failed to log role change: {exc}")
+
+        return reponse
 
     def get_queryset(self):
         """Return users visible to the requester based on their role,
@@ -431,7 +541,7 @@ class FichierViewSet(viewsets.ModelViewSet):
     """ViewSet for managing uploaded Fichier records."""
 
     serializer_class = FichierSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, PeutGererFichiers]
     pagination_class = None
 
     def get_queryset(self):
@@ -461,10 +571,12 @@ class LogViewSet(viewsets.ModelViewSet):
         """Return logs filtered by role and optional query params."""
         user = self.request.user
         if user.role == 'SUPERADMIN':
-            # Confidentialité : les évènements visiteurs (VISITEUR_ENTREE / SORTIE)
-            # contiennent des données d'identité appartenant au client ; on ne les
-            # expose pas au superadmin. Le client garde l'accès à son propre audit.
-            queryset = Log.objects.exclude(action__startswith='VISITEUR')
+            # Confidentialité : l'opérateur ClariDoc ne lit PAS l'activité de ses
+            # clients — ni les scans (dont le libellé porte le nom du document), ni
+            # les visiteurs. Il ne voit que les évènements de fonctionnement, définis
+            # en liste blanche par Log.ACTIONS_VISIBLES_SUPERADMIN : tout ce qui n'y
+            # figure pas est privé par défaut, y compris un futur type d'évènement.
+            queryset = Log.objects.filter(Log.filtre_visible_superadmin())
         else:
             queryset = Log.objects.filter(client_id=user.client_id)
 
@@ -505,11 +617,17 @@ class LogViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def action_stats(self, request):
-        """Return action volume grouped by client and action type (SuperAdmin only)."""
+        """Return action volume grouped by client and action type (SuperAdmin only).
+
+        Même liste blanche que le journal lui-même : ce décompte portait sinon
+        l'activité privée des clients sous une autre forme (« SCAN_PDF : 143 »,
+        « VISITEUR_ENTREE : 42 » pour telle société).
+        """
         if request.user.role != 'SUPERADMIN':
             return Response({"detail": "Non autorisé"}, status=403)
         stats = (
-            Log.objects.values('client__id', 'client__nom', 'client__code_client', 'action')
+            Log.objects.filter(Log.filtre_visible_superadmin())
+            .values('client__id', 'client__nom', 'client__code_client', 'action')
             .annotate(count=Count('id'))
             .order_by('client__nom', 'action')
         )
@@ -570,7 +688,7 @@ class SuccursaleConfigView(APIView):
         # ouvrait la page et enregistrait sans toucher au champ rechiffrait donc
         # le chiffre, et le mot de passe devenait inutilisable en silence.
         # Le clair n'est expose qu'aux roles qui peuvent deja le MODIFIER.
-        peut_voir = bool(user.client) and user.role in ('SUPERADMIN', 'BOSS', 'ADMIN')
+        peut_voir = bool(user.client) and user.est_administrateur
         mot_de_passe = ''
         if peut_voir and cfg['ftp_password_enc']:
             aes, iv = cles_licence(succursale)
@@ -597,7 +715,7 @@ class SuccursaleConfigView(APIView):
     def put(self, request):
         """Update the FTP configuration of the resolved succursale."""
         user = request.user
-        if not user.client or user.role not in ('SUPERADMIN', 'BOSS', 'ADMIN'):
+        if not user.client or not user.est_administrateur:
             return Response(
                 {"message": "Permissions insuffisantes."},
                 status=status.HTTP_403_FORBIDDEN
@@ -1055,6 +1173,8 @@ class VisiteurViewSet(viewsets.ModelViewSet):
         # Confidentialité : les données d'identité des visiteurs appartiennent au
         # client. Le SUPERADMIN (opérateur ClariDoc) n'y a JAMAIS accès, comme pour
         # les fichiers scannés (cf. FichierViewSet).
+        # Aucun autre filtre de rôle ici : le registre reste ouvert à TOUS les rôles
+        # du client (USER compris), le gardien s'y ajoute simplement.
         if user.role == 'SUPERADMIN':
             return Visiteur.objects.none()
         if user.client:

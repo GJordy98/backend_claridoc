@@ -142,6 +142,11 @@ class LogSerializer(serializers.ModelSerializer):
     user_nom = serializers.CharField(source='user.username', read_only=True)
     client_nom = serializers.CharField(source='client.nom', read_only=True)
 
+    # Le tri entre journal technique et activite privee du client ne se fait PAS
+    # ici mais en amont, dans LogViewSet.get_queryset : un superadmin ne recoit
+    # que les evenements de Log.ACTIONS_VISIBLES_SUPERADMIN. Masquer des champs
+    # au sortir aurait vide les libelles dont il a justement besoin pour
+    # diagnostiquer (« Connexion reussie depuis l'application Bureau. »).
     class Meta:  # type: ignore[misc]
         """Meta options for LogSerializer."""
         model = Log
