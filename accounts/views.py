@@ -17,6 +17,7 @@ from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count, Max, Q, Sum
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -1345,9 +1346,32 @@ class FicheHotelViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def depart(self, request, pk=None):  # pylint: disable=unused-argument
-        """Clôture le séjour : le client a quitté l'établissement."""
+        """Clôture le séjour : le client a quitté l'établissement.
+
+        `date_depart_reelle` est FACULTATIF mais determinant. Le poste peut
+        enregistrer un depart alors que le reseau est coupe et ne le remonter
+        que plus tard : horodater ici avec timezone.now() daterait le depart de
+        l'instant de la synchronisation, pas de celui ou le client a rendu sa
+        chambre. Sur un registre tenu a des fins de police, l'ecart n'est pas
+        cosmetique. Le poste envoie donc l'heure qu'il a constatee.
+
+        Une date posterieure a maintenant est ignoree : elle ne peut venir que
+        d'une horloge de poste dereglee, et une sortie dans le futur serait plus
+        trompeuse qu'une sortie horodatee a la reception.
+        """
         fiche = self.get_object()
-        fiche.date_depart_reelle = timezone.now()
+
+        date_depart = timezone.now()
+        date_brute = request.data.get('date_depart_reelle')
+        if date_brute:
+            date_fournie = parse_datetime(str(date_brute))
+            if date_fournie is not None:
+                if timezone.is_naive(date_fournie):
+                    date_fournie = timezone.make_aware(date_fournie)
+                if date_fournie <= date_depart:
+                    date_depart = date_fournie
+
+        fiche.date_depart_reelle = date_depart
         fiche.statut = FicheHotel.StatutFiche.TERMINE
         fiche.save()
         create_log(
