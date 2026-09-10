@@ -48,13 +48,18 @@ class Succursale(models.Model):
     ville = models.CharField(max_length=100, null=True, blank=True)
     adresse = models.TextField(null=True, blank=True)
 
-    # Configuration FTP indépendante par succursale
-    ftp_host = models.CharField(max_length=255, default='127.0.0.1')
-    ftp_port = models.IntegerField(default=21)
-    ftp_user = models.CharField(max_length=150, default='claridoc_ftp')
-    ftp_password_enc = models.TextField(null=True, blank=True)
-    ftp_fingerprint = models.CharField(max_length=255, null=True, blank=True)
-    ftp_base_path = models.CharField(max_length=255, default='/ClariDoc_Cloud/')
+    # La configuration du serveur de fichiers (hote, compte, mot de passe, chemin)
+    # NE VIT PLUS ICI depuis le 09/09/2026. Elle est deposee chiffree sur le
+    # reseau de chaque agence et lue par les postes avec leur cle d'agence.
+    #
+    # Elle etait stockee ici et servie a l'application dans la charge utile de
+    # licence AVEC la cle qui la dechiffre : le chiffrement en base ne protegeait
+    # donc rien, et le portail exposait meme le mot de passe en clair. Le serveur
+    # de fichiers appartient au reseau du client ; ses identifiants n'ont aucune
+    # raison d'exister sur cette plateforme, ni d'etre modifiables depuis un
+    # navigateur par un utilisateur non technique.
+    #
+    # Seule la LICENCE continue de venir d'ici.
     storage_mode = models.CharField(max_length=20, default='LOCAL')
 
     created_at = models.DateTimeField(auto_now_add=True)

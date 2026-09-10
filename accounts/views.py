@@ -38,7 +38,7 @@ from .serializers import (
 )
 from .services import (
     cles_licence, decrypt_simple_string, encrypt_license_data,
-    encrypt_simple_string, generate_aes_credentials, resoudre_config_ftp,
+    encrypt_simple_string, generate_aes_credentials,
     send_otp_email
 )
 
@@ -507,29 +507,16 @@ class StartupVerifyView(APIView):
             forfait_pr.forfait_postes if (forfait_pr and forfait_pr.forfait_postes) else ''
         )
 
-        # Configuration FTP effective : celle de la succursale, ou a defaut celle
-        # d'une autre agence du MEME CLIENT (rechiffree pour cette licence).
-        # Sans ce repli, toute agence creee sans configuration FTP — le champ est
-        # vide par defaut — livrait un mot de passe vide a l'application, qui
-        # basculait hors-ligne en accusant le serveur de fichiers.
-        cfg_ftp = resoudre_config_ftp(succ)
-
         payload = {
             'client_id': client.id,
             'max_postes': licence.max_machines,
             'expiration': licence.date_fin.strftime('%Y-%m-%d'),
             'plan': plan_forfait,
             'forfait_postes': forfait_postes,
-            # Infos FTP pour la liaison locale
-            'ftp_host': cfg_ftp['ftp_host'],
-            'ftp_port': cfg_ftp['ftp_port'],
-            'ftp_user': cfg_ftp['ftp_user'],
-            'ftp_password_enc': cfg_ftp['ftp_password_enc'],
-            'ftp_base_path': cfg_ftp['ftp_base_path'],
-            'ftp_fingerprint': cfg_ftp['ftp_fingerprint'],
-            # Aucune configuration FTP nulle part pour ce client : l'application
-            # doit le DIRE, au lieu de laisser croire a un serveur en panne.
-            'ftp_configuree': cfg_ftp['configuree']
+            # La charge utile ne porte plus AUCUNE donnee de serveur de fichiers :
+            # elle voyageait jusqu'ici accompagnee de la cle qui la dechiffre.
+            # L'application lit desormais cette configuration sur le reseau de
+            # l'agence, avec la cle posee sur le poste par le technicien.
         }
         licence.cle_chiffree = encrypt_license_data(payload, licence.aes_key_hex, licence.iv_hex)
         licence.save()
@@ -656,126 +643,11 @@ class LogViewSet(viewsets.ModelViewSet):
 # =============================================================================
 # ENDPOINT SUCCURSALE CONFIG (FTP)
 # =============================================================================
-class SuccursaleConfigView(APIView):
-    """API view for reading and updating the FTP configuration of a Succursale."""
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def _get_target_succursale(self, user, request):
-        """Resolve the target succursale from query params or user profile."""
-        succ_id = request.query_params.get('succursale_id') or request.data.get('succursale_id')
-        if succ_id:
-            try:
-                return Succursale.objects.get(id=succ_id, client=user.client)
-            except Succursale.DoesNotExist:
-                return None
-        if user.succursale:
-            return user.succursale
-        if user.role == 'BOSS' and user.client:
-            return user.client.succursales.first()
-        return None
-
-    def get(self, request):
-        """Return the FTP configuration of the resolved succursale."""
-        user = request.user
-        succursale = self._get_target_succursale(user, request)
-        if not succursale:
-            return Response(
-                {"message": "Aucune succursale associée ou trouvée."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        # Meme resolution que pour la payload de licence : l'ecran d'admin doit
-        # montrer la configuration REELLEMENT utilisee par l'application, sinon
-        # une agence qui fonctionne par heritage y apparaitrait vide.
-        cfg = resoudre_config_ftp(succursale)
-
-        # Le mot de passe est renvoye EN CLAIR, jamais chiffre.
-        # L'ancien comportement renvoyait le texte chiffre dans un champ que le
-        # PUT, lui, traite comme un mot de passe a chiffrer : un responsable qui
-        # ouvrait la page et enregistrait sans toucher au champ rechiffrait donc
-        # le chiffre, et le mot de passe devenait inutilisable en silence.
-        # Le clair n'est expose qu'aux roles qui peuvent deja le MODIFIER.
-        peut_voir = bool(user.client) and user.est_administrateur
-        mot_de_passe = ''
-        if peut_voir and cfg['ftp_password_enc']:
-            aes, iv = cles_licence(succursale)
-            if aes:
-                try:
-                    mot_de_passe = decrypt_simple_string(cfg['ftp_password_enc'], aes, iv)
-                except Exception:  # pylint: disable=broad-except
-                    mot_de_passe = ''
-
-        return Response({
-            "succursale_id": succursale.id,
-            "ftp_host": cfg['ftp_host'],
-            "ftp_port": cfg['ftp_port'],
-            "ftp_user": cfg['ftp_user'],
-            "ftp_password": mot_de_passe,
-            "ftp_fingerprint": cfg['ftp_fingerprint'],
-            "ftp_base_path": cfg['ftp_base_path'],
-            "storage_mode": cfg['storage_mode'],
-            # Diagnostic : d'ou vient cette configuration.
-            "herite_de": cfg['herite_de'],
-            "configuree": cfg['configuree']
-        }, status=status.HTTP_200_OK)
-
-    def put(self, request):
-        """Update the FTP configuration of the resolved succursale."""
-        user = request.user
-        if not user.client or not user.est_administrateur:
-            return Response(
-                {"message": "Permissions insuffisantes."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        succursale = self._get_target_succursale(user, request)
-        if not succursale:
-            return Response(
-                {"message": "Aucune succursale associée ou trouvée."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        data = request.data
-        if 'ftp_host' in data:
-            succursale.ftp_host = data['ftp_host']
-        if 'ftp_port' in data:
-            succursale.ftp_port = data['ftp_port']
-        if 'ftp_user' in data:
-            succursale.ftp_user = data['ftp_user']
-        # Deux champs aux sens DISTINCTS, pour lever l'ambiguite qui corrompait
-        # le mot de passe :
-        #   ftp_password     -> mot de passe EN CLAIR, chiffre ici (portail web)
-        #   ftp_password_enc -> DEJA chiffre par l'appelant, stocke tel quel
-        #                       (application C#, qui chiffre cote client dans
-        #                        FormAdmin avant l'envoi)
-        # Auparavant les deux clients ecrivaient dans ftp_password_enc, que cette
-        # vue chiffrait systematiquement : le C# subissait donc un DOUBLE
-        # chiffrement et le portail renvoyait le chiffre lu au GET.
-        if 'ftp_password' in data:
-            clair = data['ftp_password']
-            if clair:
-                aes, iv = cles_licence(succursale, creer=True)
-                succursale.ftp_password_enc = (
-                    encrypt_simple_string(clair, aes, iv) if aes else clair
-                )
-            else:
-                succursale.ftp_password_enc = ""
-        elif 'ftp_password_enc' in data:
-            succursale.ftp_password_enc = data['ftp_password_enc'] or ""
-        if 'ftp_fingerprint' in data:
-            succursale.ftp_fingerprint = data['ftp_fingerprint']
-        if 'ftp_base_path' in data:
-            succursale.ftp_base_path = data['ftp_base_path']
-        if 'storage_mode' in data:
-            succursale.storage_mode = data['storage_mode']
-        succursale.save()
-        create_log(
-            user, "CONFIG_UPDATE",
-            f"Mise à jour de la configuration FTP pour {succursale.nom}.",
-            client=succursale.client, succursale=succursale
-        )
-        return Response(
-            {"message": "Configuration sauvegardée et sécurisée."},
-            status=status.HTTP_200_OK
-        )
+# La configuration du serveur de fichiers n'est plus servie ni modifiable par
+# cette API (09/09/2026). Elle est posee sur place par le technicien ClariDoc,
+# chiffree sur le reseau de l'agence, et ne remonte jamais ici : ni lecture, ni
+# ecriture, ni mot de passe en clair renvoye a un navigateur.
+# L'ancienne vue SuccursaleConfigView et sa route /config/ sont supprimees.
 
 # =============================================================================
 # ENDPOINT MACHINES

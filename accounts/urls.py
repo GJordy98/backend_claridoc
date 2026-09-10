@@ -7,7 +7,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     UserViewSet, ClientViewSet, SuccursaleViewSet, LicenceViewSet,
     CustomTokenObtainPairView, StartupVerifyView, FichierViewSet, LogViewSet,
-    MachineViewSet, SuccursaleConfigView, PaymentRequestViewSet, RegisterView,
+    MachineViewSet, PaymentRequestViewSet, RegisterView,
     VerifyOTPView, UniversalResetPasswordView, VisiteurViewSet, FicheHotelViewSet,
     ConfigFicheHotelView, HubSummaryView
 )
@@ -37,9 +37,6 @@ urlpatterns = [
     path('auth/verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-
-    # Route pour la configuration FTP de la succursale
-    path('config/', SuccursaleConfigView.as_view(), name='succursale_config'),
 
     # Route pour la configuration et personnalisation de la fiche hôtel (charte + champs)
     path('config-fiche-hotel/', ConfigFicheHotelView.as_view(), name='config_fiche_hotel'),
