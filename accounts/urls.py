@@ -9,7 +9,7 @@ from .views import (
     CustomTokenObtainPairView, StartupVerifyView, FichierViewSet, LogViewSet,
     MachineViewSet, PaymentRequestViewSet, RegisterView,
     VerifyOTPView, UniversalResetPasswordView, VisiteurViewSet, FicheHotelViewSet,
-    ConfigFicheHotelView, HubSummaryView
+    ConfigFicheHotelView, HubSummaryView, TicketCaisseViewSet, ClotureCaisseViewSet
 )
 
 router = DefaultRouter()
@@ -23,11 +23,15 @@ router.register(r'machines', MachineViewSet, basename='machine')
 router.register(r'payments', PaymentRequestViewSet, basename='payment')
 router.register(r'visiteurs', VisiteurViewSet, basename='visiteur')
 router.register(r'fiches-hotel', FicheHotelViewSet, basename='fichehotel')
+router.register(r'tickets-caisse', TicketCaisseViewSet, basename='ticketcaisse')
+router.register(r'clotures-caisse', ClotureCaisseViewSet, basename='cloturecaisse')
 
 urlpatterns = [
-    # Route pour le Hub d'Administration d'Entreprise / Supervision Centralisée
-    path('hub-summary/', HubSummaryView.as_view(), name='hub_summary'),
+    # Routes pour le Hub d'Administration Centralisée (Contrat standard & compatibilité)
+    path('admin/summary/', HubSummaryView.as_view(), name='admin_summary_std'),
     path('admin-summary/', HubSummaryView.as_view(), name='admin_summary'),
+    path('hub-summary/', HubSummaryView.as_view(), name='hub_summary'),
+    path('hub-metrics/', HubSummaryView.as_view(), name='hub_metrics'),
 
     # Route PUBLIQUE : vérification de licence au démarrage de l'app C#
     path('startup/verify/', StartupVerifyView.as_view(), name='startup_verify'),

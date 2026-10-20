@@ -1,12 +1,17 @@
 # pyright: reportIncompatibleMethodOverride=false, reportIncompatibleVariableOverride=false
 """Serializers for the accounts application of ClariDoc Pro."""
 from typing import Any, cast
+from datetime import timedelta
+from decimal import Decimal
+from django.db import models, transaction
+from django.utils import timezone
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import (
     Client, Succursale, Licence, Fichier, Log, Machine, PaymentRequest, Visiteur,
-    FicheHotel, FicheHotelAccompagnant, FicheHotelCoOccupant, ConfigFicheHotel
+    FicheHotel, FicheHotelAccompagnant, FicheHotelCoOccupant, ConfigFicheHotel,
+    TicketCaisse, TicketCaisseLigne, ClotureCaisse
 )
 
 User = get_user_model()
@@ -237,6 +242,7 @@ class FicheHotelCoOccupantSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'nom', 'prenom', 'date_naissance',
             'lieu_naissance', 'nationalite', 'numero_identite', 'type_document',
+            'signee',
         ]
 
 
@@ -267,7 +273,9 @@ class FicheHotelSerializer(serializers.ModelSerializer):
         fields = '__all__'
         # La numerotation est attribuee par le serveur (cf. FicheHotelViewSet) :
         # un poste ne peut ni la choisir ni la corriger.
-        read_only_fields = ['client', 'annee', 'numero_fiche', 'created_at']
+        # heure_sortie_prevue est calculee par le backend (date_arrivee + duree_heures) :
+        # le client envoie uniquement duree_heures, jamais l'heure calculee.
+        read_only_fields = ['client', 'annee', 'numero_fiche', 'heure_sortie_prevue', 'created_at']
 
     def get_reference(self, obj):
         """Reference lisible de la fiche, telle qu'imprimee."""
@@ -372,3 +380,251 @@ class ConfigFicheHotelSerializer(serializers.ModelSerializer):
         if not data.get('champs'):
             data['champs'] = self.CHAMPS_CONFIGURABLES_DEFAUT
         return data
+
+
+# ── Tickets de caisse ─────────────────────────────────────────────────────────
+
+def _tronquer_champs_texte(modele, donnees):
+    """Coupe les chaînes trop longues à la taille de leur colonne.
+
+    Le texte vient de l'OCR : une enseigne mal lue peut faire 400 caractères.
+    Refuser le ticket (400) serait pire que de le tronquer, car la file de
+    synchronisation du poste rejouerait indéfiniment un envoi refusé.
+    """
+    if not hasattr(donnees, 'items'):
+        return donnees
+    propre = dict(donnees.items())
+    for champ in modele._meta.get_fields():  # pylint: disable=protected-access
+        # CharField seulement : UUIDField annonce aussi max_length=32, et tronquer
+        # un UUID de 36 caractères le rendrait invalide (ticket refusé en boucle).
+        if not isinstance(champ, models.CharField):
+            continue
+        longueur = getattr(champ, 'max_length', None)
+        valeur = propre.get(champ.name)
+        if longueur and isinstance(valeur, str) and len(valeur) > longueur:
+            propre[champ.name] = valeur[:longueur]
+    return propre
+
+
+class TicketCaisseLigneSerializer(serializers.ModelSerializer):
+    """Ligne d'article d'un ticket de caisse."""
+
+    class Meta:  # type: ignore[misc]
+        """Meta options for TicketCaisseLigneSerializer."""
+        model = TicketCaisseLigne
+        fields = ['id', 'ordre', 'code', 'designation', 'quantite',
+                  'prix_unitaire', 'remise', 'montant', 'tva']
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(_tronquer_champs_texte(TicketCaisseLigne, data))
+
+
+class TicketCaisseSerializer(serializers.ModelSerializer):
+    """Ticket de caisse et ses lignes, écrits en un seul appel.
+
+    Posés par le SERVEUR, jamais par le poste : la société cliente, la journée
+    comptable, le contrôle de cohérence, l'auteur de la saisie et tout ce qui
+    touche au contrôle (statut, contrôleur, date, commentaire — passent par
+    l'action `controler`).
+    """
+    lignes = TicketCaisseLigneSerializer(many=True, required=False)
+    succursale_nom = serializers.CharField(source='succursale.nom', read_only=True, default=None)
+    saisi_par_nom = serializers.CharField(source='saisi_par.username', read_only=True, default=None)
+    controle_par_nom = serializers.CharField(source='controle_par.username', read_only=True, default=None)
+    type_ticket_libelle = serializers.CharField(source='get_type_ticket_display', read_only=True)
+    statut_libelle = serializers.CharField(source='get_statut_display', read_only=True)
+    ecart = serializers.SerializerMethodField()
+    # Jour LOCAL de la saisie sur le poste (05/10/2026). Pas une colonne : il ne
+    # sert qu'à poser la journée d'un ticket SANS date imprimée. Avant, cette
+    # journée était le jour où le serveur RECEVAIT le ticket : saisi hors ligne
+    # lundi, remonté mercredi, il manquait à la clôture de lundi.
+    journee_saisie = serializers.DateField(write_only=True, required=False, allow_null=True)
+
+    class Meta:  # type: ignore[misc]
+        """Meta options for TicketCaisseSerializer."""
+        model = TicketCaisse
+        fields = '__all__'
+        read_only_fields = [
+            'client', 'journee', 'somme_articles', 'coherent', 'statut',
+            'saisi_par', 'controle_par', 'date_controle', 'commentaire_controle',
+            'apres_cloture', 'created_at', 'updated_at',
+        ]
+        # Texte OCR complet : ÉCRIT par le poste, JAMAIS renvoyé (décision du
+        # 25/09/2026). C'est la transcription du ticket, presque le ticket
+        # lui-même : il reste en base pour un litige, pas sur le portail.
+        extra_kwargs = {'texte_ocr': {'write_only': True}}
+
+    def get_ecart(self, obj):
+        """Total imprimé − somme des articles (None si l'un des deux manque)."""
+        if obj.total is None or obj.somme_articles is None:
+            return None
+        return obj.total - obj.somme_articles
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(_tronquer_champs_texte(TicketCaisse, data))
+
+    @staticmethod
+    def _egal(a, b):
+        """Même tolérance que le poste (TicketParser.Egal) : arrondis de caisse."""
+        return abs(a - b) <= max(Decimal('1'), abs(b) * Decimal('0.005'))
+
+    @staticmethod
+    def _journee_saisie_plausible(journee_saisie):
+        """Le jour de saisie annoncé par le poste, ou None s'il n'est pas crédible.
+
+        Un jour d'avance est admis : le serveur compte en UTC, le poste en heure
+        locale (UTC+1 au Cameroun), donc entre 23h et minuit le poste est déjà au
+        lendemain. Au-delà, l'horloge du poste est fausse : on retombe sur le jour
+        de réception plutôt que de ranger une recette dans le futur.
+        """
+        if journee_saisie is None:
+            return None
+        if journee_saisie > timezone.localdate() + timedelta(days=1):
+            return None
+        return journee_saisie
+
+    @classmethod
+    def recalculer(cls, ticket, journee_saisie=None):
+        """Journée comptable + somme des articles + cohérence, puis sauvegarde.
+
+        Journée : la date imprimée ; sinon le jour de saisie annoncé par le poste ;
+        sinon (poste d'avant le 05/10/2026, ou horloge invraisemblable) le jour de
+        réception.
+        """
+        ticket.journee = (ticket.date_ticket
+                          or cls._journee_saisie_plausible(journee_saisie)
+                          or timezone.localdate(ticket.created_at or timezone.now()))
+        # Requête directe, pas ticket.lignes.all() : sur une mise à jour, la
+        # relation peut être en cache (prefetch) et donner les ANCIENNES lignes.
+        montants = [
+            m for m in TicketCaisseLigne.objects.filter(ticket=ticket).values_list('montant', flat=True)
+            if m is not None
+        ]
+        ticket.somme_articles = sum(montants, Decimal('0')) if montants else None
+
+        if ticket.total is None or ticket.somme_articles is None:
+            ticket.coherent = None
+        else:
+            somme, total = ticket.somme_articles, ticket.total
+            remise = abs(ticket.remise_totale or 0)
+            ticket.coherent = (
+                cls._egal(somme, total)
+                or (remise > 0 and cls._egal(somme - remise, total))
+                or (ticket.sous_total is not None and cls._egal(somme, ticket.sous_total))
+            )
+        ticket.save(update_fields=['journee', 'somme_articles', 'coherent', 'updated_at'])
+        return ticket
+
+    @staticmethod
+    def _ecrire_lignes(ticket, lignes):
+        for i, ligne in enumerate(lignes):
+            ligne.setdefault('ordre', i)
+            TicketCaisseLigne.objects.create(ticket=ticket, **ligne)
+
+    def create(self, validated_data):
+        lignes = validated_data.pop('lignes', [])
+        journee_saisie = validated_data.pop('journee_saisie', None)
+        # journee est obligatoire en base : valeur provisoire, recalculée juste après.
+        validated_data.setdefault('journee', validated_data.get('date_ticket') or timezone.localdate())
+        with transaction.atomic():
+            ticket = TicketCaisse.objects.create(**validated_data)
+            self._ecrire_lignes(ticket, lignes)
+            return self.recalculer(ticket, journee_saisie)
+
+    def update(self, instance, validated_data):
+        """Les lignes fournies REMPLACENT la liste ; absentes, elles sont conservées."""
+        lignes = validated_data.pop('lignes', None)
+        journee_saisie = validated_data.pop('journee_saisie', None)
+        with transaction.atomic():
+            for champ, valeur in validated_data.items():
+                setattr(instance, champ, valeur)
+            instance.save()
+            if lignes is not None:
+                instance.lignes.all().delete()
+                self._ecrire_lignes(instance, lignes)
+            # Correction sans jour de saisie : on garde la journée déjà retenue
+            # plutôt que de retomber sur la date de création au serveur.
+            if journee_saisie is None and not instance.date_ticket:
+                journee_saisie = instance.journee
+            return self.recalculer(instance, journee_saisie)
+
+
+class ClotureCaisseSerializer(serializers.ModelSerializer):
+    """Clôture de caisse d'une journée.
+
+    Le poste n'envoie que `journee`, `especes_comptees` et `commentaire` : tout
+    le reste — les totaux constatés, l'écart, l'auteur — est posé par le
+    serveur. Un poste ne déclare pas lui-même ce que la caisse devait contenir.
+    """
+    cloture_par_nom = serializers.CharField(source='cloture_par.username', read_only=True, default=None)
+    succursale_nom = serializers.CharField(source='succursale.nom', read_only=True, default=None)
+    totaux_actuels = serializers.SerializerMethodField()
+    desynchronise = serializers.SerializerMethodField()
+    nb_tickets_apres_cloture = serializers.SerializerMethodField()
+    # Validée ici plutôt que lue brute dans la vue : une date illisible donnait
+    # une erreur 500 au lieu d'un refus clair.
+    journee = serializers.DateField(
+        required=False,
+        input_formats=['%Y-%m-%d', '%d/%m/%Y'],
+        error_messages={
+            'invalid': "Date de journée invalide : attendue au format AAAA-MM-JJ (ex. 2026-10-15).",
+        })
+
+    class Meta:  # type: ignore[misc]
+        """Meta options for ClotureCaisseSerializer."""
+        model = ClotureCaisse
+        fields = '__all__'
+        read_only_fields = [
+            'client', 'succursale', 'nb_tickets', 'total_ventes', 'total_achats',
+            'total_attendu', 'ecart', 'cloture_par', 'date_cloture',
+        ]
+
+    @staticmethod
+    def totaux_journee(client_id, succursale_id, journee):
+        """Ce que les tickets de la journée annoncent EN CE MOMENT.
+
+        Sert deux fois : pour figer les totaux à la clôture, et pour détecter
+        ensuite qu'un ticket est arrivé en retard.
+        """
+        qs = TicketCaisse.objects.filter(client_id=client_id, journee=journee)
+        if succursale_id is None:
+            qs = qs.filter(succursale__isnull=True)
+        else:
+            qs = qs.filter(succursale_id=succursale_id)
+        agg = qs.aggregate(
+            nb=models.Count('id'),
+            ventes=models.Sum('total', filter=models.Q(type_ticket=TicketCaisse.TypeTicket.VENTE)),
+            achats=models.Sum('total', filter=models.Q(type_ticket=TicketCaisse.TypeTicket.ACHAT)),
+        )
+        ventes = agg['ventes'] or Decimal('0')
+        achats = agg['achats'] or Decimal('0')
+        return {
+            'nb_tickets': agg['nb'] or 0,
+            'total_ventes': ventes,
+            'total_achats': achats,
+            'total_attendu': ventes - achats,
+        }
+
+    def get_totaux_actuels(self, obj):
+        """Recalcul à l'instant de la lecture — à comparer aux totaux figés."""
+        return self.totaux_journee(obj.client_id, obj.succursale_id, obj.journee)
+
+    def get_nb_tickets_apres_cloture(self, obj):
+        """Tickets de la journée arrivés (ou déplacés) après la clôture : déjà
+        comptés dans les totaux actualisés, signalés « en retard »."""
+        qs = TicketCaisse.objects.filter(client_id=obj.client_id, journee=obj.journee,
+                                         apres_cloture=True)
+        if obj.succursale_id is None:
+            return qs.filter(succursale__isnull=True).count()
+        return qs.filter(succursale_id=obj.succursale_id).count()
+
+    def get_desynchronise(self, obj):
+        """Vrai si la journée ne dit plus la même chose que la clôture enregistrée.
+
+        Depuis le 15/10/2026 la clôture est actualisée à chaque écriture de
+        ticket : ce drapeau ne devrait plus se lever. Il reste comme filet de
+        sécurité (écriture hors API, admin Django…).
+        """
+        actuels = self.get_totaux_actuels(obj)
+        return (actuels['nb_tickets'] != obj.nb_tickets
+                or actuels['total_attendu'] != obj.total_attendu)

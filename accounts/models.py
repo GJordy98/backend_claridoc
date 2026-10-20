@@ -2,6 +2,7 @@
 Models for the accounts application, defining Clients, Succursales, Users, and Licences.
 """
 import datetime
+from decimal import Decimal
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
@@ -508,6 +509,21 @@ class FicheHotel(models.Model):
     )
     date_depart_reelle = models.DateTimeField(null=True, blank=True)
 
+    # ── Séjour horaire (optionnel) ────────────────────────────────────────
+    # Un hôtel peut louer une chambre à l'heure (chambre de repos, passage).
+    # Si null → séjour en nuitées classique, rien ne change.
+    # Si renseigné → heure_sortie_prevue est calculée par le backend au moment
+    # de l'enregistrement : date_arrivee + duree_heures. On stocke le résultat
+    # pour pouvoir répondre à la requête d'alertes sans calcul à la volée.
+    duree_heures = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Durée réservée en heures (séjour horaire). Null = séjour en nuitées."
+    )
+    heure_sortie_prevue = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Calculée = date_arrivee + duree_heures. Nulle si séjour en nuitées."
+    )
+
     fiche_pdf_chemin = models.TextField(null=True, blank=True)
     signee = models.BooleanField(default=False)
 
@@ -571,6 +587,9 @@ class FicheHotelCoOccupant(models.Model):
     nationalite = models.CharField(max_length=100, null=True, blank=True)
     numero_identite = models.CharField(max_length=100, null=True, blank=True)
     type_document = models.CharField(max_length=20, null=True, blank=True)
+    # Le co-occupant signe la fiche comme le voyageur principal. Seul le drapeau
+    # remonte : l'encre est dans le PDF archivé sur le serveur de fichiers.
+    signee = models.BooleanField(default=False)
 
     class Meta:
         """Options du modèle FicheHotelCoOccupant."""
@@ -611,3 +630,226 @@ class ConfigFicheHotel(models.Model):
 
     def __str__(self):
         return f"Config Fiche Hôtel - {self.client.nom}"  # pylint: disable=no-member
+
+
+class TicketCaisse(models.Model):
+    """Ticket de caisse numérisé (onglet « Tickets de caisse » de l'appli).
+
+    Deux familles sur la même table, distinguées par `type_ticket` :
+      * VENTE — émis par la caisse du magasin (contrôle du chiffre du jour) ;
+      * ACHAT — dépense rapportée par le personnel (contrôle des achats).
+
+    Circuit (décision du 25/09/2026) : le USER scanne et enregistre, l'ADMIN et
+    le BOSS contrôlent tous les tickets du client, seul le BOSS supprime.
+    Comme les fichiers, visiteurs et fiches hôtel, le SUPERADMIN n'y a jamais
+    accès : ce sont des données commerciales du client.
+
+    TOUT ce qui a été lu est gardé : les champs reconnus, les lignes d'articles,
+    le reste dans `autres_informations`, et le texte OCR complet dans
+    `texte_ocr` pour pouvoir toujours revenir à la source.
+
+    L'IMAGE du ticket, elle, ne remonte jamais au serveur (voir plus bas).
+    """
+
+    class TypeTicket(models.TextChoices):
+        """Vente (caisse du magasin) ou achat (dépense)."""
+        VENTE = 'VENTE', 'Vente'
+        ACHAT = 'ACHAT', 'Achat'
+
+    class StatutTicket(models.TextChoices):
+        """Où en est le contrôle du ticket."""
+        SAISI = 'SAISI', 'Saisi, à contrôler'
+        CONTROLE = 'CONTROLE', 'Contrôlé'
+        ANOMALIE = 'ANOMALIE', 'Anomalie signalée'
+
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='tickets_caisse')
+    succursale = models.ForeignKey(
+        Succursale, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='tickets_caisse'
+    )
+
+    # Identifiant attribué par le POSTE à la création. La file de synchronisation
+    # rejoue un envoi dont elle n'a pas reçu la réponse : sans cette clé, une
+    # coupure réseau au mauvais moment enregistrerait le ticket deux fois — et
+    # doublerait le chiffre du jour. Le serveur renvoie alors le ticket existant.
+    uid_poste = models.UUIDField(null=True, blank=True, unique=True)
+
+    type_ticket = models.CharField(
+        max_length=10, choices=TypeTicket.choices, default=TypeTicket.VENTE, db_index=True
+    )
+    statut = models.CharField(
+        max_length=20, choices=StatutTicket.choices, default=StatutTicket.SAISI, db_index=True
+    )
+
+    # ── En-tête du ticket ─────────────────────────────────────────────────
+    enseigne = models.CharField(max_length=255, null=True, blank=True)
+    adresse = models.TextField(null=True, blank=True)
+    telephone = models.CharField(max_length=80, null=True, blank=True)
+    niu = models.CharField(max_length=40, null=True, blank=True)
+    rccm = models.CharField(max_length=80, null=True, blank=True)
+    numero_ticket = models.CharField(max_length=80, null=True, blank=True, db_index=True)
+    date_ticket = models.DateField(null=True, blank=True)
+    heure_ticket = models.TimeField(null=True, blank=True)
+    caisse = models.CharField(max_length=40, null=True, blank=True)
+    caissier = models.CharField(max_length=150, null=True, blank=True)
+    # « client » est déjà la société cliente de ClariDoc : le client inscrit
+    # sur le ticket porte donc un autre nom.
+    client_ticket = models.CharField(max_length=255, null=True, blank=True)
+
+    # ── Totaux et règlement ───────────────────────────────────────────────
+    sous_total = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    remise_totale = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    tva = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    total = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    mode_paiement = models.CharField(max_length=100, null=True, blank=True)
+    montant_recu = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    monnaie_rendue = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    devise = models.CharField(max_length=10, default='FCFA')
+
+    autres_informations = models.TextField(null=True, blank=True)
+    texte_ocr = models.TextField(null=True, blank=True)
+    # PAS d'image ni de chemin d'image ici, volontairement (décision du
+    # 25/09/2026) : le patron voit sur le portail les CHIFFRES du ticket
+    # (produits, totaux), jamais le ticket lui-même. L'image reste sur le
+    # poste et le serveur de fichiers de l'agence.
+
+    # ── Journée comptable ─────────────────────────────────────────────────
+    # Jour auquel le ticket est rattaché pour la vérification de fin de
+    # journée : la date imprimée si elle a été lue, sinon le jour de saisie.
+    # Posé par le serveur (cf. TicketCaisseSerializer).
+    journee = models.DateField(db_index=True)
+
+    # ── Cohérence, recalculée par le SERVEUR à chaque écriture ────────────
+    # Le poste affiche son propre contrôle, mais c'est celui-ci qui fait foi :
+    # un poste d'une version antérieure ou une saisie manuelle ne peuvent pas
+    # déclarer « cohérent » un ticket qui ne l'est pas.
+    somme_articles = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    coherent = models.BooleanField(null=True, blank=True)
+
+    # Arrivé (ou déplacé par une correction de date) dans une journée DÉJÀ
+    # clôturée (décision du 15/10/2026) : le ticket est accepté, la clôture est
+    # actualisée, et ce drapeau le signale « en retard ». Posé par le serveur,
+    # jamais retiré : c'est un fait, pas un état.
+    apres_cloture = models.BooleanField(default=False)
+
+    # ── Traçabilité ───────────────────────────────────────────────────────
+    saisi_par = models.ForeignKey(
+        'User', on_delete=models.SET_NULL, null=True, blank=True, related_name='tickets_saisis'
+    )
+    controle_par = models.ForeignKey(
+        'User', on_delete=models.SET_NULL, null=True, blank=True, related_name='tickets_controles'
+    )
+    date_controle = models.DateTimeField(null=True, blank=True)
+    commentaire_controle = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Options du modèle TicketCaisse."""
+        ordering = ['-journee', '-created_at']
+        indexes = [models.Index(fields=['client', 'journee'])]
+
+    def __str__(self):
+        return f"Ticket {self.get_type_ticket_display()} {self.numero_ticket or self.pk} · {self.total}"
+
+    objects = models.Manager()
+
+
+class TicketCaisseLigne(models.Model):
+    """Ligne d'article d'un ticket de caisse.
+
+    Table liée plutôt que JSON : le patron doit pouvoir demander « combien de
+    sacs de ciment achetés ce mois-ci », ce qu'un bloc JSON rendrait
+    ininterrogeable.
+    """
+    ticket = models.ForeignKey(TicketCaisse, on_delete=models.CASCADE, related_name='lignes')
+    ordre = models.PositiveSmallIntegerField(default=0)
+    code = models.CharField(max_length=40, null=True, blank=True)
+    designation = models.CharField(max_length=255, null=True, blank=True)
+    quantite = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    prix_unitaire = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    remise = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    montant = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    tva = models.CharField(max_length=20, null=True, blank=True)
+
+    class Meta:
+        """Options du modèle TicketCaisseLigne."""
+        ordering = ['ordre', 'id']
+
+    def __str__(self):
+        return f"{self.designation or ''} {self.montant or ''}".strip()
+
+    objects = models.Manager()
+
+
+class ClotureCaisse(models.Model):
+    """Clôture de la caisse pour une journée et une succursale.
+
+    Ce que l'ADMIN ou le BOSS fait en fin de journée : il compte les espèces en
+    caisse, les compare à ce que les tickets annoncent, et signe l'écart. C'est
+    la pièce qui transforme une liste de tickets en un contrôle comptable.
+
+    ────────────────────────────────────────────────────────────────────────
+    UN TICKET EN RETARD EST ACCEPTÉ, ET LA CAISSE EST ACTUALISÉE
+    ────────────────────────────────────────────────────────────────────────
+    Règle du 15/10/2026 (elle remplace celle des totaux figés du 28/09).
+    Un poste resté hors ligne peut remonter un ticket d'une journée déjà
+    clôturée, ou une correction de date peut y déplacer un ticket. Le refuser
+    le laisserait indéfiniment dans la file de reprise du poste (qui n'abandonne
+    jamais) et ferait disparaître une recette. Il est donc accepté, la clôture
+    est RECALCULÉE (totaux, nombre de tickets, écart avec les espèces comptées,
+    qui, elles, ne bougent pas), et le ticket porte `apres_cloture` : il est
+    signalé « en retard » au portail et sur le poste.
+
+    Toute écriture du BOSS sur une journée close (correction, suppression)
+    actualise de même la clôture. `desynchronise` reste calculé par sécurité.
+
+    En revanche, MODIFIER ou SUPPRIMER un ticket déjà rangé dans une journée
+    clôturée est refusé (sauf au BOSS) : là, il ne s'agit plus d'un retard
+    mais d'une réécriture.
+    """
+
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='clotures_caisse')
+    succursale = models.ForeignKey(
+        Succursale, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='clotures_caisse'
+    )
+    journee = models.DateField(db_index=True)
+
+    # ── Ce que les tickets annoncent (relevé à la clôture, actualisé par les
+    #    tickets arrivés après — règle du 15/10/2026) ──────────────────────
+    nb_tickets = models.PositiveIntegerField(default=0)
+    total_ventes = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    total_achats = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    # ventes − achats : ce qui devrait se trouver en caisse.
+    total_attendu = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+
+    # ── Ce que l'agent a compté ───────────────────────────────────────────
+    especes_comptees = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    # comptées − attendu. Négatif = il manque de l'argent en caisse.
+    ecart = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+
+    commentaire = models.TextField(null=True, blank=True)
+
+    cloture_par = models.ForeignKey(
+        'User', on_delete=models.SET_NULL, null=True, blank=True, related_name='clotures_caisse'
+    )
+    date_cloture = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        """Options du modèle ClotureCaisse."""
+        ordering = ['-journee', '-date_cloture']
+        # Une seule clôture par journée et par point de vente. Reclôturer exige
+        # de rouvrir d'abord — sinon deux clôtures contradictoires coexisteraient.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['client', 'succursale', 'journee'],
+                name='cloture_unique_par_journee_et_succursale',
+            )
+        ]
+
+    def __str__(self):
+        return f"Clôture {self.journee} — attendu {self.total_attendu}, écart {self.ecart}"
+
+    objects = models.Manager()

@@ -72,6 +72,11 @@ STEEVE_HUB_WEBHOOK_SECRET = os.environ.get('STEEVE_HUB_WEBHOOK_SECRET', '')
 STEEVE_HUB_BASE_URL = os.environ.get('STEEVE_HUB_BASE_URL', 'http://109.199.117.118:8081/api-v1')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
 
+# AdminHub Central Supervision Configuration
+ADMINHUB_SECRET_TOKEN = os.environ.get('ADMINHUB_SECRET_TOKEN', '')
+# Autoriser l'intégration en iframe par l'AdminHub centralisé
+X_FRAME_OPTIONS = 'ALLOWALL'
+
 # CAPTCHA Turnstile Configuration
 TURNSTILE_SECRET_KEY = os.environ.get('TURNSTILE_SECRET_KEY', '1x0000000000000000000000000000000AA')
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"

@@ -4,22 +4,22 @@
 import os
 import random
 import string
-import sys
 import uuid
-from datetime import date as date_type
+from datetime import date as date_type, timedelta
 
-import django
 import requests
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db import transaction
-from django.db.models import Count, Max, Q, Sum
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Count, Max, Min, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
@@ -28,17 +28,16 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     Client, Fichier, Licence, Log, Machine, PaymentRequest, Succursale,
-    OTPVerification, Visiteur, FicheHotel, ConfigFicheHotel
+    OTPVerification, Visiteur, FicheHotel, ConfigFicheHotel, TicketCaisse, ClotureCaisse
 )
 from .serializers import (
     ClientSerializer, CustomTokenObtainPairSerializer, FichierSerializer,
     LicenceSerializer, LogSerializer, MachineSerializer, PaymentRequestSerializer,
     SuccursaleSerializer, UserSerializer, VisiteurSerializer, FicheHotelSerializer,
-    ConfigFicheHotelSerializer
+    ConfigFicheHotelSerializer, TicketCaisseSerializer, ClotureCaisseSerializer
 )
 from .services import (
-    cles_licence, decrypt_simple_string, encrypt_license_data,
-    encrypt_simple_string, generate_aes_credentials,
+    encrypt_license_data, generate_aes_credentials,
     send_otp_email
 )
 
@@ -1187,9 +1186,18 @@ class FicheHotelViewSet(viewsets.ModelViewSet):
             dernier = FicheHotel.objects.filter(
                 client=client, annee=annee
             ).aggregate(Max('numero_fiche'))['numero_fiche__max'] or 0
+            # Calcul de l'heure de sortie prévue pour les séjours horaires.
+            # On repose le résultat en base pour que la requête d'alertes
+            # reste un simple filtre sur un champ indexable, sans calcul
+            # à la volée sur chaque ligne du registre.
+            duree_h = serializer.validated_data.get('duree_heures')
+            date_arrivee = serializer.validated_data.get('date_arrivee', timezone.now())
+            heure_sortie = (date_arrivee + timedelta(hours=int(duree_h))) if duree_h else None
+
             fiche = serializer.save(
                 client=client, succursale=succursale,
                 annee=annee, numero_fiche=dernier + 1,
+                heure_sortie_prevue=heure_sortie,
             )
 
         create_log(
@@ -1207,7 +1215,16 @@ class FicheHotelViewSet(viewsets.ModelViewSet):
         L'opérateur peut corriger ce que l'OCR a mal lu, y compris après
         validation. La trace de la correction, elle, ne se perd pas.
         """
-        fiche = serializer.save()
+        # Recalculer heure_sortie_prevue si duree_heures a changé.
+        duree_h = serializer.validated_data.get('duree_heures', serializer.instance.duree_heures)
+        if duree_h:
+            date_arrivee = serializer.validated_data.get(
+                'date_arrivee', serializer.instance.date_arrivee
+            )
+            heure_sortie = date_arrivee + timedelta(hours=int(duree_h))
+        else:
+            heure_sortie = None
+        fiche = serializer.save(heure_sortie_prevue=heure_sortie)
         create_log(
             self.request.user,
             "FICHE_HOTEL_MODIF",
@@ -1215,6 +1232,35 @@ class FicheHotelViewSet(viewsets.ModelViewSet):
             client=fiche.client,
             succursale=fiche.succursale,
         )
+
+    # url_path explicite : sans lui, DRF publie la route avec le nom de la
+    # méthode (« alertes_horaires »), et l'URL appelée par le poste
+    # (« alertes-horaires ») tombe sur la route de détail -> 404.
+    @action(detail=False, methods=['get'], url_path='alertes-horaires')
+    def alertes_horaires(self, request):
+        """Fiches EN_COURS dont l'heure de sortie prévue approche ou est dépassée.
+
+        Interrogée toutes les minutes par l'app C# desktop (USER / ADMIN).
+        Paramètre `minutes_avant` (défaut 15) : remonte les fiches dont
+        heure_sortie_prevue <= maintenant + minutes_avant.
+        Les fiches dont l'heure est déjà dépassée sont incluses volontairement :
+        elles restent en alerte tant que le départ n'est pas validé.
+        """
+        try:
+            minutes_avant = int(request.query_params.get('minutes_avant', 15))
+        except (ValueError, TypeError):
+            minutes_avant = 15
+
+        maintenant = timezone.now()
+        limite = maintenant + timedelta(minutes=minutes_avant)
+
+        qs = self.get_queryset().filter(
+            statut=FicheHotel.StatutFiche.EN_COURS,
+            heure_sortie_prevue__isnull=False,
+            heure_sortie_prevue__lte=limite,
+        )
+        serializer = self.get_serializer(qs, many=True)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['post'])
     def depart(self, request, pk=None):  # pylint: disable=unused-argument
@@ -1423,35 +1469,42 @@ class ConfigFicheHotelView(APIView):
 
 
 class HubSummaryView(APIView):
-    """API de Sommaire Centralisée pour le Hub d'Administration d'Entreprise.
-    
+    """API de Sommaire Centralisée conforme au Contrat d'Observabilité de l'AdminHub.
 
-    Expose en un seul appel consolidé toutes les métriques métier, le registre d'activité,
-    les erreurs/bugs récents, et l'état de santé du système pour le Hub Supervision.
-    
+    Expose en un seul appel consolidé :
+    - Les métriques instantanées (clients, appareils, documents)
+    - Les alertes système et licences
+    - Les finances et abonnements avec MRR normalisé
+    - Les données métier spécifiques à ClariDoc Pro
 
     Authentification :
-    - Via Token dans le header `X-Hub-Token` ou paramètre `?token=...`
-    - OU via JWT utilisateur authentifié (SUPERADMIN, BOSS, ADMIN).
+    - Header `X-Hub-Token` comparé à settings.ADMINHUB_SECRET_TOKEN
+    - OU paramètre d'URL `?token=...`
+    - OU session utilisateur authentifié (SUPERADMIN, BOSS, ADMIN).
     """
     permission_classes = [permissions.AllowAny]
 
     def _est_autorise(self, request):
-        token_env = os.environ.get('ADMIN_HUB_TOKEN', getattr(settings, 'STEEVE_HUB_TOKEN', ''))
+        token_env = (
+            os.environ.get('ADMINHUB_SECRET_TOKEN')
+            or getattr(settings, 'ADMINHUB_SECRET_TOKEN', None)
+            or os.environ.get('ADMIN_HUB_TOKEN')
+            or getattr(settings, 'STEEVE_HUB_TOKEN', None)
+        )
         token_req = request.headers.get('X-Hub-Token') or request.query_params.get('token')
-        if token_env and token_req and token_req.strip() == token_env.strip():
+        if token_req and token_env and token_req.strip() == str(token_env).strip():
             return True
         if request.user and request.user.is_authenticated:
             role = getattr(request.user, 'role', '')
             if role in ('SUPERADMIN', 'BOSS', 'ADMIN') or request.user.is_superuser:
                 return True
-        # Si aucun token configuré en env, autoriser en mode dev si DEBUG=True
-        if settings.DEBUG and not token_env:
+        # Mode développement : autoriser si aucun token n'est configuré en production
+        if settings.DEBUG and not os.environ.get('ADMINHUB_SECRET_TOKEN'):
             return True
         return False
 
     def get(self, request):
-        """Retourne le sommaire consolidé du Hub d'Administration."""
+        """Retourne le sommaire standardisé pour l'AdminHub."""
         if not self._est_autorise(request):
             return Response(
                 {"error": (
@@ -1462,15 +1515,33 @@ class HubSummaryView(APIView):
             )
 
         now = timezone.now()
+        today = now.date()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        last_24h = now - timedelta(hours=24)
+        last_30d = now - timedelta(days=30)
 
-        # ── 1. Métriques globales ───────────────────────────────────────────
+        # ── 1. Clients & Utilisateurs ─────────────────────────────────────────
         total_clients = Client.objects.count()
         active_clients = Client.objects.filter(is_active=True).count()
         total_succursales = Succursale.objects.count()
         total_users = User.objects.count()
+
+        active_users_24h = (
+            Log.objects.filter(created_at__gte=last_24h).values('user').distinct().count()
+        )
+        if active_users_24h == 0:
+            active_users_24h = User.objects.filter(is_active=True).count()
+
+        total_inactive = total_clients - active_clients
+        churn_rate_30d = round(total_inactive / total_clients, 2) if total_clients > 0 else 0.0
+        new_subscribers_30d = Client.objects.filter(created_at__gte=last_30d).count()
+
+        # ── 2. Métiers (Visiteurs, Fiches Hôtel, Fichiers, Machines) ────────────
         total_visiteurs = Visiteur.objects.count()
         total_fiches_hotel = FicheHotel.objects.count()
+        fiches_hotel_en_cours = FicheHotel.objects.filter(
+            statut=FicheHotel.StatutFiche.EN_COURS
+        ).count()
         total_fichiers = Fichier.objects.count()
         total_storage_bytes = Fichier.objects.aggregate(total=Sum('taille_octets'))['total'] or 0
         total_machines = Machine.objects.count()
@@ -1479,126 +1550,592 @@ class HubSummaryView(APIView):
             statut=PaymentRequest.StatutPaiement.EN_ATTENTE
         ).count()
 
-        # ── 2. Activité du jour ──────────────────────────────────────────────
+        # Activité du jour
         visiteurs_today = Visiteur.objects.filter(created_at__gte=today_start).count()
         fiches_hotel_today = FicheHotel.objects.filter(created_at__gte=today_start).count()
         fichiers_today = Fichier.objects.filter(created_at__gte=today_start).count()
         logs_today = Log.objects.filter(created_at__gte=today_start).count()
+        activity_today = fichiers_today + visiteurs_today + fiches_hotel_today + logs_today
 
-        # Filtre d'erreurs/bugs récents dans les logs
-        error_filter = (
-            Q(action__icontains='ERROR') |
-            Q(action__icontains='FAIL') |
-            Q(action__icontains='REJETE') |
-            Q(action__icontains='EXPIRED') |
-            Q(details__icontains='Exception') |
-            Q(details__icontains='Error') |
-            Q(details__icontains='Échec')
-        )
-        errors_today = Log.objects.filter(error_filter, created_at__gte=today_start).count()
+        # ── 3. Finances & Abonnements (MRR normalisé) ──────────────────────────
+        valid_payments = PaymentRequest.objects.filter(statut=PaymentRequest.StatutPaiement.VALIDE)
 
-        # ── 3. Derniers logs système (Audit) ──────────────────────────────────
-        logs_qs = (
-            Log.objects.select_related('user', 'client', 'succursale')
-            .order_by('-created_at')[:25]
+        monthly_data = valid_payments.filter(forfait_duree__icontains='Mensuel').aggregate(
+            c=Count('id'), total=Sum('montant')
         )
-        recent_logs = []
-        for l in logs_qs:
-            recent_logs.append({
-                'id': l.id,
-                'created_at': l.created_at.isoformat(),
-                'action': l.action,
-                'details': l.details,
-                'nom_fichier': l.nom_fichier,
-                'type_document': l.type_document,
-                'user': l.user.username if l.user else None,
-                'client': l.client.nom if l.client else None,
-                'succursale': l.succursale.nom if l.succursale else None,
+        monthly_count = monthly_data['c'] or 0
+        monthly_amount = int(monthly_data['total'] or 0)
+
+        quarterly_data = valid_payments.filter(forfait_duree__icontains='Trimestriel').aggregate(
+            c=Count('id'), total=Sum('montant')
+        )
+        quarterly_count = quarterly_data['c'] or 0
+        quarterly_amount = int(quarterly_data['total'] or 0)
+
+        semestrial_data = valid_payments.filter(forfait_duree__icontains='Semestriel').aggregate(
+            c=Count('id'), total=Sum('montant')
+        )
+        semestrial_count = semestrial_data['c'] or 0
+        semestrial_amount = int(semestrial_data['total'] or 0)
+
+        annual_data = valid_payments.filter(forfait_duree__icontains='Annuel').aggregate(
+            c=Count('id'), total=Sum('montant')
+        )
+        annual_count = annual_data['c'] or 0
+        annual_amount = int(annual_data['total'] or 0)
+
+        # Formule stricte du Hub : Mensuel + (Trimestriel / 3) + (Semestriel / 6) + (Annuel / 12)
+        mrr_normalized = round(
+            monthly_amount + (quarterly_amount / 3) + (semestrial_amount / 6) + (annual_amount / 12)
+        )
+
+        plans_qs = valid_payments.values('forfait_postes').annotate(count=Count('id'))
+        plans = [{'name': p['forfait_postes'] or 'Standard', 'count': p['count']} for p in plans_qs]
+
+        # ── 4. Alertes d'observabilité ─────────────────────────────────────────
+        alerts = []
+        # a) Licences expirant dans les 7 jours
+        soon = today + timedelta(days=7)
+        for lic in Licence.objects.filter(
+            date_fin__gte=today, date_fin__lte=soon
+        ).select_related('succursale__client'):
+            client_nom = (
+                lic.succursale.client.nom
+                if (lic.succursale and lic.succursale.client)
+                else (lic.succursale.nom if lic.succursale else 'Inconnu')
+            )
+            alerts.append({
+                'severity': 'warning',
+                'message': (
+                    f"Licence pour {client_nom} expire le {lic.date_fin.strftime('%d/%m/%Y')}"
+                ),
+                'timestamp': now.isoformat()
             })
 
-        # ── 4. Registre des Erreurs & Warnings récents ───────────────────────
-        error_logs_qs = (
-            Log.objects.filter(error_filter)
-            .select_related('user', 'client', 'succursale')
-            .order_by('-created_at')[:20]
-        )
-        recent_errors = []
-        for l in error_logs_qs:
-            recent_errors.append({
-                'id': l.id,
-                'created_at': l.created_at.isoformat(),
-                'action': l.action,
-                'details': l.details,
-                'user': l.user.username if l.user else None,
-                'client': l.client.nom if l.client else None,
+        # b) Demandes de paiement en attente
+        if pending_payments > 0:
+            alerts.append({
+                'severity': 'info',
+                'message': f"{pending_payments} demande(s) de paiement en attente de validation",
+                'timestamp': now.isoformat()
             })
 
-        # ── 5. Synthèse par Client ───────────────────────────────────────────
-        clients_qs = Client.objects.all().order_by('-created_at')
-        clients_summary = []
-        for c in clients_qs:
-            licence_fin = None
-            # Recherche de licence expirant la plus tard
-            lics = Licence.objects.filter(succursale__client=c).order_by('-date_fin')
-            if lics.exists():
-                licence_fin = str(lics.first().date_fin)
-
-            clients_summary.append({
-                'id': c.id,
-                'nom': c.nom,
-                'code_client': c.code_client,
-                'statut': c.statut,
-                'is_active': c.is_active,
-                'succursales_count': c.succursales.count(),
-                'users_count': c.users.count(),
-                'visiteurs_count': Visiteur.objects.filter(client=c).count(),
-                'fiches_hotel_count': FicheHotel.objects.filter(client=c).count(),
-                'licence_expiration': licence_fin,
+        # c) Licences échues
+        licences_expirees = Licence.objects.filter(date_fin__lt=today).count()
+        if licences_expirees > 0:
+            alerts.append({
+                'severity': 'warning',
+                'message': f"{licences_expirees} licence(s) arrivée(s) à expiration",
+                'timestamp': now.isoformat()
             })
 
-        # ── 6. État de Santé Système ─────────────────────────────────────────
-        health_info = {
-            'database': 'CONNECTED',
-            'environment': 'production' if not settings.DEBUG else 'development',
-            'debug_mode': settings.DEBUG,
-            'python_version': (
-                f"{sys.version_info.major}."
-                f"{sys.version_info.minor}."
-                f"{sys.version_info.micro}"
-            ),
-            'django_version': django.get_version(),
-            'storage_mb': round(total_storage_bytes / (1024 * 1024), 2),
+        # Détermination du statut global
+        status_system = 'healthy'
+        if any(a['severity'] == 'critical' for a in alerts):
+            status_system = 'down'
+        elif any(a['severity'] == 'warning' for a in alerts):
+            status_system = 'degraded'
+
+        # ── 5. Payload conforme au Contrat d'Observabilité de l'AdminHub ────────
+        payload = {
+            "project_name": "ClariDoc Pro",
+            "status": status_system,
+            "last_updated": now.isoformat(),
+
+            # 1. Métriques instantanées (affichées dans les cartes du Hub)
+            "metrics": [
+                {"label": "Clients actifs", "value": active_clients},
+                {"label": "Appareils connectés", "value": active_machines},
+                {"label": "Fichiers numérisés", "value": total_fichiers},
+                {"label": "Fiches hôtel", "value": total_fiches_hotel},
+                {"label": "Visiteurs", "value": total_visiteurs},
+                {"label": "Taux de disponibilité", "value": 99.9, "unit": "%"}
+            ],
+            "active_users_24h": active_users_24h,
+            "activity_today": activity_today,
+
+            # 2. Alertes éventuelles (déclenche les badges sur le Hub)
+            "alerts": alerts,
+
+            # 3. Finances & Abonnements (pour calcul du MRR / CA global sur l'accueil)
+            "subscription": {
+                "active_subscribers": active_clients,
+                "mrr_normalized": mrr_normalized,
+                "currency": "XAF",
+                "churn_rate_30d": churn_rate_30d,
+                "new_subscribers_30d": new_subscribers_30d,
+                "breakdown_by_period": {
+                    "monthly":    {"count": monthly_count,    "raw_amount": monthly_amount},
+                    "quarterly":  {"count": quarterly_count,  "raw_amount": quarterly_amount},
+                    "semestrial": {"count": semestrial_count, "raw_amount": semestrial_amount},
+                    "annual":     {"count": annual_count,     "raw_amount": annual_amount}
+                },
+                "plans": plans
+            },
+
+            # 4. Données spécifiques métier (onglet dédié ClariDoc)
+            "project_specific": {
+                "kind": "claridoc",
+                "total_clients": total_clients,
+                "active_clients": active_clients,
+                "total_succursales": total_succursales,
+                "total_users": total_users,
+                "total_fichiers": total_fichiers,
+                "scans_today": fichiers_today,
+                "fiches_hotel_total": total_fiches_hotel,
+                "fiches_hotel_en_cours": fiches_hotel_en_cours,
+                "fiches_hotel_today": fiches_hotel_today,
+                "visiteurs_total": total_visiteurs,
+                "visiteurs_today": visiteurs_today,
+                "total_machines": total_machines,
+                "active_machines": active_machines,
+                "pending_payments": pending_payments,
+                "storage_mb": round(total_storage_bytes / (1024 * 1024), 2)
+            }
         }
 
-        data = {
-            'status': 'SUCCESS',
-            'app_name': 'ClariDoc Pro Backend API',
-            'version': '2.1.0',
-            'timestamp': now.isoformat(),
-            'system_health': health_info,
-            'metrics': {
-                'total_clients': total_clients,
-                'active_clients': active_clients,
-                'total_succursales': total_succursales,
-                'total_users': total_users,
-                'total_visiteurs': total_visiteurs,
-                'total_fiches_hotel': total_fiches_hotel,
-                'total_fichiers': total_fichiers,
-                'total_storage_bytes': total_storage_bytes,
-                'total_machines': total_machines,
-                'active_machines': active_machines,
-                'pending_payments': pending_payments,
-            },
-            'today_activity': {
-                'visiteurs_today': visiteurs_today,
-                'fiches_hotel_today': fiches_hotel_today,
-                'fichiers_today': fichiers_today,
-                'logs_today': logs_today,
-                'errors_today': errors_today,
-            },
-            'recent_logs': recent_logs,
-            'system_errors_and_alerts': recent_errors,
-            'clients_summary': clients_summary,
-        }
+        return Response(payload, status=status.HTTP_200_OK)
 
-        return Response(data, status=status.HTTP_200_OK)
+
+# ── Tickets de caisse ─────────────────────────────────────────────────────────
+
+class PeutGererTickets(permissions.BasePermission):
+    """Circuit des tickets de caisse (décision du 25/09/2026).
+
+    USER        — enregistre, voit et corrige SES tickets tant qu'ils ne sont
+                  pas contrôlés ;
+    ADMIN/BOSS  — voient et contrôlent TOUS les tickets du client, lisent le
+                  récapitulatif ;
+    BOSS seul   — supprime.
+    GARDIEN et SUPERADMIN : aucun accès (le superadmin ne voit jamais les
+    données commerciales d'un client).
+    """
+    message = "Ce compte n'a pas accès aux tickets de caisse."
+
+    ROLES_ACCES = ('BOSS', 'ADMIN', 'USER')
+    ROLES_CONTROLE = ('BOSS', 'ADMIN')
+    ACTIONS_CONTROLE = ('controler', 'resume')
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated and user.client_id and user.role in self.ROLES_ACCES):
+            return False
+        if view.action == 'destroy':
+            self.message = "Seul le chef d'entreprise peut supprimer un ticket enregistré."
+            return user.role == 'BOSS'
+        if view.action in self.ACTIONS_CONTROLE:
+            self.message = ("Le contrôle des tickets est réservé à l'administrateur "
+                            "et au chef d'entreprise.")
+            return user.role in self.ROLES_CONTROLE
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if user.role in self.ROLES_CONTROLE:
+            return True
+        # USER : ses propres tickets, et plus de correction une fois contrôlés.
+        if obj.saisi_par_id != user.id:
+            return False
+        if (request.method not in permissions.SAFE_METHODS
+                and obj.statut == TicketCaisse.StatutTicket.CONTROLE):
+            self.message = "Ce ticket a déjà été contrôlé : seul un administrateur peut le modifier."
+            return False
+        return True
+
+
+class TicketCaissePagination(PageNumberPagination):
+    """100 tickets par page (une journée de boutique tient en un appel)."""
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+
+class TicketCaisseViewSet(viewsets.ModelViewSet):
+    """Tickets de caisse (ventes et achats) et récapitulatif de fin de journée."""
+    serializer_class = TicketCaisseSerializer
+    permission_classes = [permissions.IsAuthenticated, PeutGererTickets]
+    pagination_class = TicketCaissePagination
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.role == 'SUPERADMIN' or not user.client_id:
+            return TicketCaisse.objects.none()
+        qs = (TicketCaisse.objects.filter(client_id=user.client_id)
+              .select_related('succursale', 'saisi_par', 'controle_par')
+              .prefetch_related('lignes'))
+        if user.role == 'USER':
+            qs = qs.filter(saisi_par=user)
+        return self._filtrer(qs)
+
+    def _filtrer(self, qs):
+        """?journee= | ?date_debut=&date_fin=, ?type_ticket=, ?statut=,
+        ?succursale=, ?saisi_par=, ?coherent=true|false, ?q= (enseigne, n°)."""
+        p = self.request.query_params
+        if p.get('journee'):
+            qs = qs.filter(journee=p['journee'])
+        if p.get('date_debut'):
+            qs = qs.filter(journee__gte=p['date_debut'])
+        if p.get('date_fin'):
+            qs = qs.filter(journee__lte=p['date_fin'])
+        if p.get('type_ticket'):
+            qs = qs.filter(type_ticket=p['type_ticket'].upper())
+        if p.get('statut'):
+            qs = qs.filter(statut=p['statut'].upper())
+        if p.get('succursale'):
+            qs = qs.filter(succursale_id=p['succursale'])
+        if p.get('saisi_par'):
+            qs = qs.filter(saisi_par_id=p['saisi_par'])
+        if p.get('coherent') in ('true', 'false'):
+            qs = qs.filter(coherent=(p['coherent'] == 'true'))
+        if p.get('q'):
+            qs = qs.filter(Q(enseigne__icontains=p['q']) | Q(numero_ticket__icontains=p['q']))
+        return qs
+
+    @staticmethod
+    def _reference(ticket):
+        return ticket.numero_ticket or f"#{ticket.pk}"
+
+    def create(self, request, *args, **kwargs):
+        """Enregistrement idempotent : un `uid_poste` déjà connu renvoie le ticket existant.
+
+        La file de synchronisation du poste rejoue les envois restés sans
+        réponse ; créer un doublon doublerait le chiffre de la journée.
+        """
+        uid = request.data.get('uid_poste')
+        if uid:
+            try:
+                existant = TicketCaisse.objects.filter(uid_poste=uid).first()
+            except (ValueError, DjangoValidationError):
+                existant = None
+            if existant is not None:
+                if existant.client_id != request.user.client_id:
+                    return Response({"detail": "Identifiant de ticket déjà utilisé."},
+                                    status=status.HTTP_409_CONFLICT)
+                return Response(self.get_serializer(existant).data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
+    @staticmethod
+    def _cle_journee(ticket):
+        return (ticket.client_id, ticket.succursale_id, ticket.journee)
+
+    @staticmethod
+    def _actualiser_cloture(cle):
+        """Recalcule la clôture de la journée `cle`, s'il y en a une (règle du 15/10/2026).
+
+        Les espèces comptées ne bougent pas ; les totaux, le nombre de tickets et
+        l'écart suivent les tickets. Renvoie (clôture, ancien attendu) ou (None, None).
+        """
+        client_id, succursale_id, journee = cle
+        cloture = ClotureCaisse.objects.filter(client_id=client_id, succursale_id=succursale_id,
+                                               journee=journee).first()
+        if cloture is None:
+            return None, None
+        avant = cloture.total_attendu
+        totaux = ClotureCaisseSerializer.totaux_journee(client_id, succursale_id, journee)
+        for champ, valeur in totaux.items():
+            setattr(cloture, champ, valeur)
+        cloture.ecart = (None if cloture.especes_comptees is None
+                         else cloture.especes_comptees - totaux['total_attendu'])
+        cloture.save(update_fields=list(totaux) + ['ecart'])
+        return cloture, avant
+
+    def _suivre_cloture(self, ticket, ancienne_cle=None):
+        """Après une écriture : ticket arrivé dans une journée close = « en retard »
+        et caisse actualisée ; journée quittée par le ticket actualisée aussi.
+        Renvoie le complément de journal (vide si aucune clôture n'est touchée)."""
+        cle = self._cle_journee(ticket)
+        suite = ""
+        cloture, avant = self._actualiser_cloture(cle)
+        if cloture is not None:
+            if ancienne_cle != cle and not ticket.apres_cloture:
+                ticket.apres_cloture = True
+                ticket.save(update_fields=['apres_cloture'])
+            suite = (f" — APRÈS LA CLÔTURE du {ticket.journee} : caisse actualisée, attendu "
+                     f"{avant} → {cloture.total_attendu}, écart {cloture.ecart}")
+        if ancienne_cle is not None and ancienne_cle != cle:
+            self._actualiser_cloture(ancienne_cle)
+        return suite
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        ticket = serializer.save(client=user.client, succursale=user.succursale, saisi_par=user)
+        # Un poste resté hors ligne peut remonter un ticket d'une journée déjà
+        # clôturée : on l'ACCEPTE (le refuser ferait disparaître une recette et
+        # bloquerait sa file de reprise), la caisse est actualisée et le ticket
+        # marqué « en retard ».
+        retard = self._suivre_cloture(ticket)
+        create_log(
+            user, "TICKET_CREE",
+            f"Ticket {ticket.get_type_ticket_display().lower()} {self._reference(ticket)} "
+            f"— total {ticket.total} {ticket.devise}{retard}.",
+            client=ticket.client, succursale=ticket.succursale,
+        )
+
+    def _refuser_si_journee_close(self, ticket):
+        """Interdit de retoucher un ticket d'une journée déjà clôturée.
+
+        Un ticket EN RETARD reste accepté (voir ClotureCaisse) : ce n'est pas la
+        même chose. Accepter une recette oubliée ne réécrit rien ; modifier ou
+        supprimer après coup, si — l'écart signé ne correspondrait plus à ce qui
+        a été compté. Le BOSS échappe au verrou, puisqu'il peut de toute façon
+        rouvrir la journée.
+        """
+        if self.request.user.role == 'BOSS':
+            return
+        if ClotureCaisse.objects.filter(client_id=ticket.client_id,
+                                        succursale_id=ticket.succursale_id,
+                                        journee=ticket.journee).exists():
+            raise PermissionDenied(
+                f"La journée du {ticket.journee} est clôturée : ce ticket ne peut plus être "
+                f"modifié. Demandez au chef d'entreprise de rouvrir la journée.")
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        self._refuser_si_journee_close(serializer.instance)
+        ancienne_cle = self._cle_journee(serializer.instance)
+        champs = {}
+        # Une correction par le USER remet le ticket « à contrôler » : l'avis
+        # d'anomalie portait sur l'ancienne version.
+        if user.role == 'USER':
+            champs = {'statut': TicketCaisse.StatutTicket.SAISI, 'controle_par': None,
+                      'date_controle': None}
+        ticket = serializer.save(**champs)
+        # Une correction de date peut déplacer le ticket VERS une journée close :
+        # accepté, caisse actualisée, ticket « en retard » (15/10/2026).
+        retard = self._suivre_cloture(ticket, ancienne_cle)
+        create_log(
+            user, "TICKET_MODIFIE", f"Ticket {self._reference(ticket)} modifié{retard}.",
+            client=ticket.client, succursale=ticket.succursale,
+        )
+
+    def perform_destroy(self, instance):
+        self._refuser_si_journee_close(instance)
+        cle = self._cle_journee(instance)
+        create_log(
+            self.request.user, "TICKET_SUPPRIME",
+            f"Ticket {instance.get_type_ticket_display().lower()} {self._reference(instance)} "
+            f"du {instance.journee} supprimé (total {instance.total} {instance.devise}).",
+            client=instance.client, succursale=instance.succursale,
+        )
+        instance.delete()
+        self._actualiser_cloture(cle)
+
+    @action(detail=True, methods=['post'])
+    def controler(self, request, pk=None):  # pylint: disable=unused-argument
+        """ADMIN / BOSS : `statut` = CONTROLE (défaut) ou ANOMALIE, `commentaire` facultatif.
+
+        Une anomalie sans commentaire est refusée : celui qui la corrige doit
+        savoir ce qui ne va pas.
+        """
+        ticket = self.get_object()
+        statut = str(request.data.get('statut') or TicketCaisse.StatutTicket.CONTROLE).upper()
+        if statut not in (TicketCaisse.StatutTicket.CONTROLE, TicketCaisse.StatutTicket.ANOMALIE):
+            return Response({"statut": "Valeurs possibles : CONTROLE, ANOMALIE."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        commentaire = (request.data.get('commentaire') or '').strip()
+        if statut == TicketCaisse.StatutTicket.ANOMALIE and not commentaire:
+            return Response({"commentaire": "Décrivez l'anomalie constatée."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        ticket.statut = statut
+        ticket.controle_par = request.user
+        ticket.date_controle = timezone.now()
+        ticket.commentaire_controle = commentaire or None
+        ticket.save(update_fields=['statut', 'controle_par', 'date_controle',
+                                   'commentaire_controle', 'updated_at'])
+        suite = f" — {commentaire}" if commentaire else ""
+        create_log(
+            request.user, "TICKET_CONTROLE",
+            f"Ticket {self._reference(ticket)} : {ticket.get_statut_display().lower()}{suite}.",
+            client=ticket.client, succursale=ticket.succursale,
+        )
+        return Response(self.get_serializer(ticket).data)
+
+    @action(detail=False, methods=['get'])
+    def resume(self, request):
+        """Récapitulatif pour le contrôle de fin de journée (ADMIN / BOSS).
+
+        Période : ?journee=AAAA-MM-JJ, ou ?date_debut=&date_fin= ; aujourd'hui
+        par défaut. Mêmes filtres que la liste (?succursale=, ?type_ticket=…).
+        Les montants sont ceux IMPRIMÉS sur les tickets (champ total).
+        """
+        p = request.query_params
+        qs = self.get_queryset()
+        if not (p.get('journee') or p.get('date_debut') or p.get('date_fin')):
+            qs = qs.filter(journee=timezone.localdate())
+        # Les agrégats n'ont pas besoin des lignes ni des jointures de la liste.
+        qs = qs.prefetch_related(None).select_related(None)
+
+        vente = Q(type_ticket=TicketCaisse.TypeTicket.VENTE)
+        achat = Q(type_ticket=TicketCaisse.TypeTicket.ACHAT)
+
+        def agregats():
+            return {
+                'nb_tickets': Count('id'),
+                'nb_ventes': Count('id', filter=vente),
+                'total_ventes': Sum('total', filter=vente),
+                'nb_achats': Count('id', filter=achat),
+                'total_achats': Sum('total', filter=achat),
+            }
+
+        def ventiler(*champs):
+            return list(qs.values(*champs).annotate(**agregats()).order_by(*champs))
+
+        global_ = qs.aggregate(
+            **agregats(),
+            a_controler=Count('id', filter=Q(statut=TicketCaisse.StatutTicket.SAISI)),
+            controles=Count('id', filter=Q(statut=TicketCaisse.StatutTicket.CONTROLE)),
+            anomalies=Count('id', filter=Q(statut=TicketCaisse.StatutTicket.ANOMALIE)),
+            incoherents=Count('id', filter=Q(coherent=False)),
+            sans_total=Count('id', filter=Q(total__isnull=True)),
+        )
+        bornes = qs.aggregate(debut=Min('journee'), fin=Max('journee'))
+        aujourd_hui = timezone.localdate()
+        return Response({
+            'periode': {
+                'debut': p.get('journee') or p.get('date_debut') or bornes['debut'] or aujourd_hui,
+                'fin': p.get('journee') or p.get('date_fin') or bornes['fin'] or aujourd_hui,
+            },
+            'global': global_,
+            'par_jour': ventiler('journee'),
+            'par_mode_paiement': ventiler('type_ticket', 'mode_paiement'),
+            'par_succursale': ventiler('succursale_id', 'succursale__nom'),
+            'par_saisisseur': ventiler('saisi_par_id', 'saisi_par__username'),
+        })
+
+
+class PeutCloturerCaisse(permissions.BasePermission):
+    """Clôture de caisse : ADMIN et BOSS la posent, le BOSS seul la rouvre.
+
+    Le USER ne la voit même pas : il enregistre des tickets, il ne signe pas
+    l'état de la caisse. GARDIEN et SUPERADMIN n'ont aucun accès, comme pour
+    les tickets eux-mêmes.
+    """
+    message = "La clôture de caisse est réservée à l'administrateur et au chef d'entreprise."
+
+    ROLES_ACCES = ('BOSS', 'ADMIN')
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated and user.client_id and user.role in self.ROLES_ACCES):
+            return False
+        if view.action in ('destroy', 'rouvrir'):
+            self.message = "Seul le chef d'entreprise peut rouvrir une journée clôturée."
+            return user.role == 'BOSS'
+        return True
+
+
+class ClotureCaisseViewSet(viewsets.ModelViewSet):
+    """Clôtures de caisse : une par journée et par succursale.
+
+    Le poste envoie `journee`, `especes_comptees` et `commentaire`. Le serveur
+    relève lui-même ce que les tickets annoncent et calcule l'écart : c'est le
+    contrôle, il ne peut pas venir de la machine contrôlée.
+    """
+    serializer_class = ClotureCaisseSerializer
+    permission_classes = [permissions.IsAuthenticated, PeutCloturerCaisse]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.role == 'SUPERADMIN' or not user.client_id:
+            return ClotureCaisse.objects.none()
+        qs = (ClotureCaisse.objects.filter(client_id=user.client_id)
+              .select_related('succursale', 'cloture_par'))
+        p = self.request.query_params
+        if p.get('journee'):
+            qs = qs.filter(journee=p['journee'])
+        if p.get('date_debut'):
+            qs = qs.filter(journee__gte=p['date_debut'])
+        if p.get('date_fin'):
+            qs = qs.filter(journee__lte=p['date_fin'])
+        if p.get('succursale'):
+            qs = qs.filter(succursale_id=p['succursale'])
+        return qs
+
+    @staticmethod
+    def _succursale_demandee(request):
+        """(succursale clôturée, réponse de refus ou None).
+
+        Clé `succursale` ABSENTE : celle du compte, comme avant le 05/10/2026.
+        Présente : le BOSS choisit parmi les succursales de SA société (null =
+        tickets sans succursale) ; un ADMIN ne peut nommer que la sienne. Sans ce
+        choix, un BOSS sans succursale clôturait une caisse vide : attendu 0,
+        écart égal aux espèces comptées.
+        """
+        user = request.user
+        if 'succursale' not in request.data:
+            return user.succursale, None
+        valeur = request.data.get('succursale')
+        if valeur in (None, ''):
+            demandee = None
+        else:
+            try:
+                demandee = Succursale.objects.filter(pk=int(valeur), client_id=user.client_id).first()
+            except (TypeError, ValueError):
+                demandee = None
+            if demandee is None:
+                return None, Response({"succursale": ["Succursale inconnue pour cette société."]},
+                                      status=status.HTTP_400_BAD_REQUEST)
+        if user.role != 'BOSS' and (demandee.pk if demandee else None) != user.succursale_id:
+            return None, Response({"detail": "Seul le chef d'entreprise peut clôturer une autre succursale."},
+                                  status=status.HTTP_403_FORBIDDEN)
+        return demandee, None
+
+    def create(self, request, *args, **kwargs):
+        """Clôture la journée demandée (aujourd'hui par défaut).
+
+        Refuse une seconde clôture : il faut rouvrir d'abord, sinon deux
+        déclarations contradictoires coexisteraient pour la même caisse.
+        """
+        user = request.user
+        # Validation AVANT toute requête : une date illisible lue brute faisait
+        # planter le filtre ci-dessous (erreur 500). Le sérialiseur renvoie un
+        # refus 400 qui dit quel format est attendu.
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        journee = serializer.validated_data.get('journee') or timezone.localdate()
+
+        succursale, refus = self._succursale_demandee(request)
+        if refus is not None:
+            return refus
+        succursale_id = succursale.pk if succursale else None
+
+        if ClotureCaisse.objects.filter(client_id=user.client_id,
+                                        succursale_id=succursale_id,
+                                        journee=journee).exists():
+            return Response(
+                {"detail": f"La journée du {journee:%d/%m/%Y} est déjà clôturée. "
+                           f"Rouvrez-la avant de la clôturer à nouveau."},
+                status=status.HTTP_409_CONFLICT)
+
+        totaux = ClotureCaisseSerializer.totaux_journee(user.client_id, succursale_id, journee)
+        especes = serializer.validated_data.get('especes_comptees')
+        ecart = None if especes is None else especes - totaux['total_attendu']
+
+        cloture = serializer.save(
+            client=user.client, succursale=succursale, journee=journee,
+            cloture_par=user, ecart=ecart, **totaux)
+
+        create_log(
+            user, "CAISSE_CLOTUREE",
+            f"Journée {cloture.journee} clôturée — attendu {cloture.total_attendu}, "
+            f"compté {cloture.especes_comptees}, écart {cloture.ecart} "
+            f"({cloture.nb_tickets} ticket(s)).",
+            client=cloture.client, succursale=cloture.succursale,
+        )
+        return Response(self.get_serializer(cloture).data, status=status.HTTP_201_CREATED)
+
+    def perform_destroy(self, instance):
+        create_log(
+            self.request.user, "CAISSE_ROUVERTE",
+            f"Journée {instance.journee} rouverte (écart signé : {instance.ecart}).",
+            client=instance.client, succursale=instance.succursale,
+        )
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def rouvrir(self, request, pk=None):  # pylint: disable=unused-argument
+        """BOSS : lève le verrou de la journée. Équivaut au DELETE, nommé pour le poste."""
+        cloture = self.get_object()
+        self.perform_destroy(cloture)
+        return Response(status=status.HTTP_204_NO_CONTENT)
